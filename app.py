@@ -1,0 +1,827 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import statsmodels.api as sm
+
+# Page config
+st.set_page_config(page_title="DCF Equity Valuation", page_icon="📊", layout="wide")
+
+# Credit spreads lookup table (from Damodaran, updated January 2025)
+CREDIT_SPREADS = [
+    {"Rating": "Aaa/AAA", "Spread": 0.45},
+    {"Rating": "Aa2/AA", "Spread": 0.60},
+    {"Rating": "A1/A+", "Spread": 0.77},
+    {"Rating": "A2/A", "Spread": 0.85},
+    {"Rating": "A3/A-", "Spread": 0.95},
+    {"Rating": "Baa2/BBB", "Spread": 1.20},
+    {"Rating": "Ba1/BB+", "Spread": 1.55},
+    {"Rating": "Ba2/BB", "Spread": 1.83},
+    {"Rating": "B1/B+", "Spread": 2.61},
+    {"Rating": "B2/B", "Spread": 3.00},
+    {"Rating": "B3/B-", "Spread": 4.42},
+    {"Rating": "Caa/CCC", "Spread": 7.28},
+    {"Rating": "Ca2/CC", "Spread": 10.10},
+    {"Rating": "C2/C", "Spread": 15.50},
+    {"Rating": "D2/D", "Spread": 19.00},
+]
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def get_credit_spread(rating):
+    """Returns the credit spread for a given rating."""
+    for entry in CREDIT_SPREADS:
+        if entry["Rating"].lower() == rating.lower():
+            return entry["Spread"] / 100
+    return None
+
+def calculate_beta(ticker_symbol, index_symbol="^GSPC"):
+    """Calculate beta using OLS regression on 5 years of monthly returns."""
+    stock_data = yf.download(ticker_symbol, period='5y', interval='1mo', progress=False)['Close']
+    index_data = yf.download(index_symbol, period='5y', interval='1mo', progress=False)['Close']
+
+    stock_returns = stock_data.pct_change().dropna()
+    index_returns = index_data.pct_change().dropna()
+
+    aligned_data = pd.concat([stock_returns, index_returns], axis=1).dropna()
+    aligned_data.columns = ['Stock', 'Market']
+
+    X = sm.add_constant(aligned_data['Market'])
+    model = sm.OLS(aligned_data['Stock'], X)
+    results = model.fit()
+
+    beta = results.params['Market']
+    r_squared = results.rsquared
+
+    return beta, r_squared, results, aligned_data
+
+def get_historical_data(ticker_symbol):
+    """Fetch and process historical financial data for a company."""
+    ticker = yf.Ticker(ticker_symbol)
+
+    # Get financial statements
+    income_statement = ticker.financials.T.sort_index()
+    balance_sheet = ticker.balance_sheet.T.sort_index()
+    cash_flows = ticker.cashflow.T.sort_index()
+
+    # Calculate margins and growth rates from income statement
+    income_statement['Gross Margin'] = income_statement['Gross Profit'] / income_statement['Total Revenue']
+    income_statement['EBIT Margin'] = income_statement['EBIT'] / income_statement['Total Revenue']
+    income_statement['Revenue Growth'] = income_statement['Total Revenue'].pct_change()
+    income_statement['EBIT Growth'] = income_statement['EBIT'].pct_change()
+
+    # Get effective tax rate
+    if 'Tax Rate For Calcs' in income_statement.columns:
+        eff_tax_rate = income_statement['Tax Rate For Calcs']
+    else:
+        # Calculate from tax provision and pretax income if available
+        if 'Tax Provision' in income_statement.columns and 'Pretax Income' in income_statement.columns:
+            eff_tax_rate = income_statement['Tax Provision'] / income_statement['Pretax Income']
+        else:
+            eff_tax_rate = pd.Series([0.21] * len(income_statement), index=income_statement.index)
+
+    # Calculate NWC from balance sheet
+    cash_col = 'Cash Cash Equivalents And Short Term Investments' if 'Cash Cash Equivalents And Short Term Investments' in balance_sheet.columns else 'Cash And Cash Equivalents'
+    debt_col = 'Current Debt And Capital Lease Obligation' if 'Current Debt And Capital Lease Obligation' in balance_sheet.columns else 'Current Debt'
+
+    balance_sheet["Adj CA"] = balance_sheet["Current Assets"] - balance_sheet.get(cash_col, 0)
+    balance_sheet["Adj CL"] = balance_sheet["Current Liabilities"] - balance_sheet.get(debt_col, 0)
+    balance_sheet["NWC"] = balance_sheet["Adj CA"] - balance_sheet["Adj CL"]
+    balance_sheet["Ch in NWC"] = balance_sheet["NWC"].diff()
+
+    # Process cash flows
+    cash_flows['Capital Expenditure'] = -cash_flows['Capital Expenditure']
+
+    # Merge for reinvestment calculation
+    merged_cf = cash_flows.join(balance_sheet[["NWC", "Ch in NWC"]])
+    merged_cf['Reinvestment'] = (
+        merged_cf['Capital Expenditure']
+        - merged_cf['Depreciation And Amortization']
+        + merged_cf['Ch in NWC']
+    )
+
+    # Calculate NOPAT
+    income_statement['NOPAT'] = income_statement['EBIT'] * (1 - eff_tax_rate)
+
+    # Build summary stats dataframe
+    df_stats = income_statement[['Revenue Growth', 'EBIT Growth', 'Gross Margin', 'EBIT Margin']].copy()
+    df_stats['Eff Tax Rate'] = eff_tax_rate
+    df_stats['NOPAT'] = income_statement['NOPAT']
+    df_stats['Reinvestment'] = merged_cf['Reinvestment']
+    df_stats['Reinv Rate'] = merged_cf['Reinvestment'] / income_statement['NOPAT']
+
+    return {
+        'income_statement': income_statement,
+        'balance_sheet': balance_sheet,
+        'cash_flows': cash_flows,
+        'merged_cf': merged_cf,
+        'df_stats': df_stats
+    }
+
+def get_ltm_revenue(ticker_symbol):
+    """Get Last Twelve Months revenue from quarterly data."""
+    ticker = yf.Ticker(ticker_symbol)
+    quarterly_data = ticker.quarterly_financials.T.sort_index()
+    ltm_data = quarterly_data.iloc[-4:]
+    ltm_revenue = ltm_data['Total Revenue'].sum()
+    most_recent_date = ltm_data.index[-1]
+    return ltm_revenue, most_recent_date
+
+def build_dcf_projections(ltm_revenue, most_recent_date, growth_rates, ebit_margins, reinv_rates, eff_tax_rate):
+    """Build projections dataframe for DCF model."""
+    time_horizon = len(growth_rates)
+
+    # Generate future dates
+    freq_dict = {1:'YE-JAN', 2:'YE-FEB', 3:'YE-MAR', 4:'YE-APR', 5:'YE-MAY', 6:'YE-JUN',
+                 7:'YE-JUL', 8:'YE-AUG', 9:'YE-SEP', 10:'YE-OCT', 11:'YE-NOV', 12:'YE-DEC'}
+    f = freq_dict[most_recent_date.month]
+    new_dates = pd.date_range(start=most_recent_date, periods=time_horizon + 1, freq=f)
+
+    # Create projections dataframe
+    projections = pd.DataFrame(index=new_dates[1:], data={
+        'Revenue Growth': growth_rates,
+        'EBIT Margin': ebit_margins,
+        'Reinv Rate': reinv_rates
+    })
+
+    # Project revenue
+    projected_revenue = [ltm_revenue]
+    for i in range(time_horizon):
+        new_revenue = projected_revenue[i] * (1 + growth_rates[i])
+        projected_revenue.append(new_revenue)
+    projected_revenue.pop(0)
+
+    projections['Revenue'] = projected_revenue
+    projections['EBIT'] = projections['Revenue'] * projections['EBIT Margin']
+    projections['NOPAT'] = projections['EBIT'] * (1 - eff_tax_rate)
+    projections['FCF'] = projections['NOPAT'] * (1 - projections['Reinv Rate'])
+    projections['T'] = range(1, time_horizon + 1)
+
+    return projections
+
+def calculate_dcf_valuation(projections, wacc, terminal_growth, total_debt, total_cash, shares_outstanding):
+    """Calculate DCF valuation and implied share price."""
+    time_horizon = len(projections)
+
+    # Discount FCF to present
+    projections['Discounted_FCF'] = projections['FCF'] / (1 + wacc) ** projections['T']
+    pv_fcf = projections['Discounted_FCF'].sum()
+
+    # Terminal value using Gordon Growth Model
+    final_fcf = projections.iloc[-1]['FCF']
+    terminal_value = final_fcf * (1 + terminal_growth) / (wacc - terminal_growth)
+    pv_terminal = terminal_value / (1 + wacc) ** time_horizon
+
+    # Enterprise value and equity value
+    enterprise_value = pv_fcf + pv_terminal
+    equity_value = enterprise_value - total_debt + total_cash
+    share_price = equity_value / shares_outstanding
+
+    return {
+        'pv_fcf': pv_fcf,
+        'terminal_value': terminal_value,
+        'pv_terminal': pv_terminal,
+        'enterprise_value': enterprise_value,
+        'equity_value': equity_value,
+        'share_price': share_price,
+        'projections': projections
+    }
+
+# ============================================================================
+# Page: Home
+# ============================================================================
+
+def render_home():
+    st.title("📊 DCF Equity Valuation")
+    st.markdown("### A Discounted Cash Flow Analysis Tool")
+
+    st.markdown("""
+    Welcome to the DCF Equity Valuation application. This tool helps you value
+    publicly traded companies using the Discounted Cash Flow methodology.
+
+    ---
+
+    #### How to Use This App
+
+    Use the tabs above to navigate through the three stages of DCF analysis:
+
+    1. **WACC Calculator** - Calculate the Weighted Average Cost of Capital
+       - Estimates cost of equity using CAPM (beta from regression)
+       - Estimates cost of debt using risk-free rate + credit spread
+       - Computes weighted average based on capital structure
+
+    2. **Historical Analysis** - Analyze historical financial performance
+       - Revenue and EBIT growth rates
+       - Gross and EBIT margins
+       - Reinvestment rates and NOPAT
+
+    3. **DCF Model** - Build the valuation model *(coming soon)*
+       - Project future free cash flows
+       - Calculate terminal value
+       - Derive implied share price
+
+    ---
+
+    #### Key Formulas
+    """)
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("**WACC**")
+        st.latex(r"WACC = w_E \times k_E + w_D \times k_D \times (1-t)")
+
+        st.markdown("**Cost of Equity (CAPM)**")
+        st.latex(r"k_E = r_f + \beta \times EMRP")
+
+    with col2:
+        st.markdown("**Free Cash Flow**")
+        st.latex(r"FCF = NOPAT \times (1 - ReinvestmentRate)")
+
+        st.markdown("**Terminal Value**")
+        st.latex(r"TV = \frac{FCF_{final} \times (1 + g)}{WACC - g}")
+
+    st.markdown("---")
+    st.caption("Built for MGT6534 | Data from Yahoo Finance")
+
+# ============================================================================
+# Page: WACC Calculator
+# ============================================================================
+
+def render_wacc():
+    st.header("WACC Calculator")
+    st.markdown("Calculate the Weighted Average Cost of Capital for any publicly traded company.")
+
+    # Inputs in columns
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        ticker_symbol = st.text_input("Ticker Symbol", value="MSFT").upper()
+        risk_free_rate = st.number_input(
+            "Risk-Free Rate (%)",
+            min_value=0.0, max_value=20.0, value=4.5, step=0.1,
+            help="Enter the current 10-year Treasury yield"
+        ) / 100
+
+    with col2:
+        emrp = st.number_input(
+            "Equity Market Risk Premium (%)",
+            min_value=0.0, max_value=20.0, value=5.0, step=0.1
+        ) / 100
+        rating_options = [entry["Rating"] for entry in CREDIT_SPREADS]
+        firm_rating = st.selectbox("Credit Rating", options=rating_options, index=0)
+
+    with col3:
+        marg_tax_rate = st.number_input(
+            "Marginal Tax Rate (%)",
+            min_value=0.0, max_value=50.0, value=25.0, step=1.0
+        ) / 100
+
+    calculate_button = st.button("Calculate WACC", type="primary")
+
+    if calculate_button:
+        with st.spinner(f"Fetching data for {ticker_symbol}..."):
+            try:
+                ticker = yf.Ticker(ticker_symbol)
+                ticker_info = ticker.info
+
+                company_name = ticker_info.get('longName', ticker_symbol)
+                market_cap = ticker_info.get('marketCap', 0)
+                total_debt = ticker_info.get('totalDebt', 0)
+
+                if market_cap == 0:
+                    st.error(f"Could not retrieve market cap for {ticker_symbol}.")
+                    st.stop()
+
+                st.subheader(f"{company_name} ({ticker_symbol})")
+
+                # Calculate weights
+                w_E = market_cap / (market_cap + total_debt)
+                w_D = total_debt / (market_cap + total_debt)
+
+                # Calculate beta
+                beta, r_squared, reg_results, return_data = calculate_beta(ticker_symbol)
+
+                # Calculate cost of equity (CAPM)
+                cost_of_equity = risk_free_rate + beta * emrp
+
+                # Calculate cost of debt
+                credit_spread = get_credit_spread(firm_rating)
+                cost_of_debt = risk_free_rate + credit_spread
+
+                # Calculate WACC
+                wacc = (w_E * cost_of_equity) + (w_D * cost_of_debt * (1 - marg_tax_rate))
+
+                # Display results
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.markdown("**Capital Structure**")
+                    st.metric("Market Cap", f"${market_cap/1e9:,.2f}B")
+                    st.metric("Total Debt", f"${total_debt/1e9:,.2f}B")
+                    st.metric("Equity Weight (w_E)", f"{w_E:.2%}")
+                    st.metric("Debt Weight (w_D)", f"{w_D:.2%}")
+
+                with col2:
+                    st.markdown("**Beta Estimation**")
+                    st.metric("Beta (β)", f"{beta:.3f}")
+                    st.metric("R-squared", f"{r_squared:.3f}")
+                    st.caption("Based on 5-year monthly returns vs S&P 500")
+
+                st.divider()
+
+                col3, col4 = st.columns(2)
+
+                with col3:
+                    st.markdown("**Cost of Equity**")
+                    st.latex(r"k_E = r_f + \beta \times EMRP")
+                    st.write(f"k_E = {risk_free_rate:.2%} + {beta:.3f} × {emrp:.2%}")
+                    st.metric("Cost of Equity (k_E)", f"{cost_of_equity:.2%}")
+
+                with col4:
+                    st.markdown("**Cost of Debt**")
+                    st.latex(r"k_D = r_f + spread")
+                    st.write(f"k_D = {risk_free_rate:.2%} + {credit_spread:.2%}")
+                    st.metric("Cost of Debt (k_D)", f"{cost_of_debt:.2%}")
+                    st.caption(f"Credit Rating: {firm_rating}")
+
+                st.divider()
+
+                # Final WACC
+                st.markdown("**Weighted Average Cost of Capital**")
+                st.latex(r"WACC = w_E \times k_E + w_D \times k_D \times (1-t)")
+                st.write(f"WACC = {w_E:.2%} × {cost_of_equity:.2%} + {w_D:.2%} × {cost_of_debt:.2%} × (1 - {marg_tax_rate:.0%})")
+
+                st.markdown(f"<h1 style='text-align: center; color: #1f77b4;'>WACC = {wacc:.2%}</h1>", unsafe_allow_html=True)
+
+                # Summary table
+                st.markdown("**Summary**")
+                summary_df = pd.DataFrame({
+                    "Metric": ["Risk-Free Rate", "Beta", "EMRP", "Cost of Equity",
+                              "Credit Spread", "Cost of Debt", "Equity Weight",
+                              "Debt Weight", "Tax Rate", "WACC"],
+                    "Value": [f"{risk_free_rate:.2%}", f"{beta:.3f}", f"{emrp:.2%}",
+                             f"{cost_of_equity:.2%}", f"{credit_spread:.2%}",
+                             f"{cost_of_debt:.2%}", f"{w_E:.2%}", f"{w_D:.2%}",
+                             f"{marg_tax_rate:.0%}", f"{wacc:.2%}"]
+                })
+                st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
+
+# ============================================================================
+# Page: Historical Analysis
+# ============================================================================
+
+def render_historical():
+    st.header("Historical Analysis")
+    st.markdown("Analyze historical financial performance: growth rates, margins, and reinvestment.")
+
+    # Inputs
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        ticker_symbol = st.text_input("Ticker Symbol", value="MSFT", key="hist_ticker").upper()
+
+    with col2:
+        scale_options = {"Millions ($M)": 1_000_000, "Billions ($B)": 1_000_000_000}
+        scale_choice = st.selectbox("Display Scale", options=list(scale_options.keys()))
+        scale_factor = scale_options[scale_choice]
+        scale_name = "$M" if scale_factor == 1_000_000 else "$B"
+
+    analyze_button = st.button("Analyze Financials", type="primary")
+
+    if analyze_button:
+        with st.spinner(f"Fetching financial data for {ticker_symbol}..."):
+            try:
+                ticker = yf.Ticker(ticker_symbol)
+                company_name = ticker.info.get('longName', ticker_symbol)
+
+                st.subheader(f"{company_name} ({ticker_symbol})")
+
+                data = get_historical_data(ticker_symbol)
+                income_statement = data['income_statement']
+                balance_sheet = data['balance_sheet']
+                merged_cf = data['merged_cf']
+                df_stats = data['df_stats']
+
+                # Section 1: Revenue and EBIT
+                st.markdown("### Income Statement Highlights")
+
+                is_display = income_statement[['Total Revenue', 'EBIT', 'Gross Profit']].copy()
+                is_display = is_display / scale_factor
+                is_display.index = is_display.index.strftime('%Y-%m-%d')
+                st.dataframe(is_display.style.format("{:,.2f}"), use_container_width=True)
+                st.caption(f"Values in {scale_name}")
+
+                # Section 2: Growth Rates and Margins
+                st.markdown("### Growth Rates & Margins")
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.markdown("**Growth Rates**")
+                    growth_df = df_stats[['Revenue Growth', 'EBIT Growth']].copy()
+                    growth_df.index = growth_df.index.strftime('%Y-%m-%d')
+                    st.dataframe(growth_df.style.format("{:.2%}"), use_container_width=True)
+
+                with col2:
+                    st.markdown("**Margins**")
+                    margin_df = df_stats[['Gross Margin', 'EBIT Margin']].copy()
+                    margin_df.index = margin_df.index.strftime('%Y-%m-%d')
+                    st.dataframe(margin_df.style.format("{:.2%}"), use_container_width=True)
+
+                # Section 3: NWC Analysis
+                st.markdown("### Working Capital Analysis")
+
+                nwc_df = balance_sheet[['NWC', 'Ch in NWC']].copy()
+                nwc_df = nwc_df / scale_factor
+                nwc_df.index = nwc_df.index.strftime('%Y-%m-%d')
+                st.dataframe(nwc_df.style.format("{:,.2f}"), use_container_width=True)
+                st.caption(f"Values in {scale_name}")
+
+                # Section 4: Reinvestment
+                st.markdown("### Reinvestment Analysis")
+
+                reinv_df = merged_cf[['Capital Expenditure', 'Depreciation And Amortization', 'Ch in NWC', 'Reinvestment']].copy()
+                reinv_df = reinv_df / scale_factor
+                reinv_df.index = reinv_df.index.strftime('%Y-%m-%d')
+                st.dataframe(reinv_df.style.format("{:,.2f}"), use_container_width=True)
+                st.caption(f"Reinvestment = CapEx - D&A + Change in NWC | Values in {scale_name}")
+
+                # Section 5: Summary Statistics
+                st.markdown("### Summary: Key Valuation Metrics")
+
+                summary_display = df_stats.copy()
+                summary_display.index = summary_display.index.strftime('%Y-%m-%d')
+
+                # Format different columns appropriately
+                format_dict = {
+                    'Revenue Growth': '{:.2%}',
+                    'EBIT Growth': '{:.2%}',
+                    'Gross Margin': '{:.2%}',
+                    'EBIT Margin': '{:.2%}',
+                    'Eff Tax Rate': '{:.2%}',
+                    'NOPAT': '{:,.0f}',
+                    'Reinvestment': '{:,.0f}',
+                    'Reinv Rate': '{:.2%}'
+                }
+
+                # Scale NOPAT and Reinvestment for display
+                summary_display['NOPAT'] = summary_display['NOPAT'] / scale_factor
+                summary_display['Reinvestment'] = summary_display['Reinvestment'] / scale_factor
+
+                st.dataframe(summary_display.style.format(format_dict), use_container_width=True)
+                st.caption(f"NOPAT and Reinvestment in {scale_name}")
+
+                # Averages for quick reference
+                st.markdown("### Historical Averages (for projections)")
+
+                avg_col1, avg_col2, avg_col3, avg_col4 = st.columns(4)
+
+                with avg_col1:
+                    avg_rev_growth = df_stats['Revenue Growth'].mean()
+                    st.metric("Avg Revenue Growth", f"{avg_rev_growth:.2%}")
+
+                with avg_col2:
+                    avg_ebit_margin = df_stats['EBIT Margin'].mean()
+                    st.metric("Avg EBIT Margin", f"{avg_ebit_margin:.2%}")
+
+                with avg_col3:
+                    avg_tax_rate = df_stats['Eff Tax Rate'].mean()
+                    st.metric("Avg Eff Tax Rate", f"{avg_tax_rate:.2%}")
+
+                with avg_col4:
+                    avg_reinv_rate = df_stats['Reinv Rate'].mean()
+                    st.metric("Avg Reinv Rate", f"{avg_reinv_rate:.2%}")
+
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
+                st.info("Please check that the ticker symbol is valid and has sufficient financial data.")
+
+# ============================================================================
+# Page: DCF Model
+# ============================================================================
+
+def render_dcf():
+    st.header("DCF Model")
+    st.markdown("Build the discounted cash flow valuation model to derive an implied share price.")
+
+    # === Section 1: Basic Inputs ===
+    st.markdown("### Company & Valuation Inputs")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        ticker_symbol = st.text_input("Ticker Symbol", value="MSFT", key="dcf_ticker").upper()
+
+    with col2:
+        wacc = st.number_input(
+            "WACC (%)",
+            min_value=1.0, max_value=30.0, value=9.0, step=0.25,
+            help="From WACC Calculator tab"
+        ) / 100
+
+    with col3:
+        terminal_growth = st.number_input(
+            "Terminal Growth Rate (%)",
+            min_value=0.0, max_value=5.0, value=3.0, step=0.25,
+            help="Long-term sustainable growth rate (typically 2-3%)"
+        ) / 100
+
+    col4, col5 = st.columns(2)
+
+    with col4:
+        eff_tax_rate = st.number_input(
+            "Effective Tax Rate (%)",
+            min_value=0.0, max_value=50.0, value=21.0, step=1.0,
+            help="From Historical Analysis tab"
+        ) / 100
+
+    with col5:
+        scale_options = {"Millions ($M)": 1_000_000, "Billions ($B)": 1_000_000_000}
+        scale_choice = st.selectbox("Display Scale", options=list(scale_options.keys()), key="dcf_scale")
+        scale_factor = scale_options[scale_choice]
+        scale_name = "$M" if scale_factor == 1_000_000 else "$B"
+
+    # === Section 2: Projection Assumptions ===
+    st.markdown("### Projection Assumptions")
+    st.caption("Enter comma-separated values for each year of your projection period (e.g., 10 years)")
+
+    # Default values matching the notebook
+    default_growth = "20, 15, 15, 15, 10, 10, 10, 8, 8, 6"
+    default_margin = "46, 46, 46, 46, 46, 46, 46, 46, 46, 46"
+    default_reinv = "40, 40, 30, 20, 20, 20, 20, 20, 20, 20"
+
+    col_a, col_b, col_c = st.columns(3)
+
+    with col_a:
+        growth_input = st.text_input(
+            "Revenue Growth Rates (%)",
+            value=default_growth,
+            help="Annual revenue growth rates for each projection year"
+        )
+
+    with col_b:
+        margin_input = st.text_input(
+            "EBIT Margins (%)",
+            value=default_margin,
+            help="EBIT margin for each projection year"
+        )
+
+    with col_c:
+        reinv_input = st.text_input(
+            "Reinvestment Rates (%)",
+            value=default_reinv,
+            help="Reinvestment rate for each projection year"
+        )
+
+    # Parse inputs
+    try:
+        growth_rates = [float(x.strip()) / 100 for x in growth_input.split(',')]
+        ebit_margins = [float(x.strip()) / 100 for x in margin_input.split(',')]
+        reinv_rates = [float(x.strip()) / 100 for x in reinv_input.split(',')]
+
+        # Validate lengths match
+        if not (len(growth_rates) == len(ebit_margins) == len(reinv_rates)):
+            st.error("All projection inputs must have the same number of values.")
+            return
+
+        time_horizon = len(growth_rates)
+        st.caption(f"Projection period: {time_horizon} years")
+
+    except ValueError:
+        st.error("Please enter valid comma-separated numbers for all projection inputs.")
+        return
+
+    # === Run Valuation Button ===
+    run_dcf = st.button("Run DCF Valuation", type="primary")
+
+    if run_dcf:
+        with st.spinner(f"Running DCF valuation for {ticker_symbol}..."):
+            try:
+                # Get company data
+                ticker = yf.Ticker(ticker_symbol)
+                ticker_info = ticker.info
+
+                company_name = ticker_info.get('longName', ticker_symbol)
+                shares_outstanding = ticker_info.get('sharesOutstanding', 0)
+                total_debt = ticker_info.get('totalDebt', 0)
+                total_cash = ticker_info.get('totalCash', 0)
+                current_price = ticker_info.get('currentPrice', ticker_info.get('regularMarketPrice', 0))
+
+                if shares_outstanding == 0:
+                    st.error(f"Could not retrieve shares outstanding for {ticker_symbol}.")
+                    return
+
+                # Get LTM Revenue
+                ltm_revenue, most_recent_date = get_ltm_revenue(ticker_symbol)
+
+                st.subheader(f"{company_name} ({ticker_symbol})")
+
+                # Display starting data
+                st.markdown("### Starting Point: LTM Data")
+                col_ltm1, col_ltm2, col_ltm3 = st.columns(3)
+                with col_ltm1:
+                    st.metric("LTM Revenue", f"{ltm_revenue/scale_factor:,.2f} {scale_name}")
+                with col_ltm2:
+                    st.metric("Most Recent Quarter", most_recent_date.strftime('%Y-%m-%d'))
+                with col_ltm3:
+                    st.metric("Shares Outstanding", f"{shares_outstanding/1e6:,.2f}M")
+
+                # Build projections
+                projections = build_dcf_projections(
+                    ltm_revenue, most_recent_date,
+                    growth_rates, ebit_margins, reinv_rates, eff_tax_rate
+                )
+
+                # Calculate valuation
+                valuation = calculate_dcf_valuation(
+                    projections, wacc, terminal_growth,
+                    total_debt, total_cash, shares_outstanding
+                )
+
+                # === Display Projections ===
+                st.markdown("### Projected Financials")
+
+                # Assumptions table
+                st.markdown("**Assumptions by Year**")
+                assumptions_df = projections[['Revenue Growth', 'EBIT Margin', 'Reinv Rate']].copy()
+                assumptions_df.index = assumptions_df.index.strftime('%Y')
+                st.dataframe(
+                    assumptions_df.style.format("{:.1%}"),
+                    use_container_width=True
+                )
+
+                # Dollar projections table
+                st.markdown("**Projected Values**")
+                dollar_cols = ['Revenue', 'EBIT', 'NOPAT', 'FCF', 'Discounted_FCF']
+                dollar_df = valuation['projections'][dollar_cols].copy() / scale_factor
+                dollar_df.index = dollar_df.index.strftime('%Y')
+                st.dataframe(
+                    dollar_df.style.format("{:,.2f}"),
+                    use_container_width=True
+                )
+                st.caption(f"Values in {scale_name}")
+
+                # === Terminal Value ===
+                st.markdown("### Terminal Value")
+
+                st.latex(r"TV = \frac{FCF_{final} \times (1 + g)}{WACC - g}")
+
+                final_fcf = projections.iloc[-1]['FCF']
+                st.write(f"TV = ({final_fcf/scale_factor:,.2f} × (1 + {terminal_growth:.2%})) / ({wacc:.2%} - {terminal_growth:.2%})")
+
+                col_tv1, col_tv2 = st.columns(2)
+                with col_tv1:
+                    st.metric("Terminal Value", f"{valuation['terminal_value']/scale_factor:,.2f} {scale_name}")
+                with col_tv2:
+                    st.metric("PV of Terminal Value", f"{valuation['pv_terminal']/scale_factor:,.2f} {scale_name}")
+
+                # === Enterprise Value ===
+                st.markdown("### Enterprise Value")
+
+                st.latex(r"EV = \sum_{t=1}^{n} \frac{FCF_t}{(1+WACC)^t} + \frac{TV}{(1+WACC)^n}")
+
+                col_ev1, col_ev2, col_ev3 = st.columns(3)
+                with col_ev1:
+                    st.metric("PV of FCFs", f"{valuation['pv_fcf']/scale_factor:,.2f} {scale_name}")
+                with col_ev2:
+                    st.metric("PV of Terminal Value", f"{valuation['pv_terminal']/scale_factor:,.2f} {scale_name}")
+                with col_ev3:
+                    st.metric("Enterprise Value", f"{valuation['enterprise_value']/scale_factor:,.2f} {scale_name}")
+
+                # === Equity Value & Share Price ===
+                st.markdown("### Equity Value & Implied Share Price")
+
+                st.latex(r"Equity\ Value = EV - Debt + Cash")
+                st.latex(r"Share\ Price = \frac{Equity\ Value}{Shares\ Outstanding}")
+
+                col_eq1, col_eq2, col_eq3 = st.columns(3)
+                with col_eq1:
+                    st.metric("Total Debt", f"{total_debt/scale_factor:,.2f} {scale_name}")
+                with col_eq2:
+                    st.metric("Total Cash", f"{total_cash/scale_factor:,.2f} {scale_name}")
+                with col_eq3:
+                    st.metric("Equity Value", f"{valuation['equity_value']/scale_factor:,.2f} {scale_name}")
+
+                st.divider()
+
+                # Final share price display
+                implied_price = valuation['share_price']
+
+                col_price1, col_price2, col_price3 = st.columns(3)
+                with col_price1:
+                    st.metric("Current Market Price", f"${current_price:,.2f}")
+                with col_price2:
+                    st.markdown(f"<h1 style='text-align: center; color: #1f77b4;'>${implied_price:,.2f}</h1>", unsafe_allow_html=True)
+                    st.markdown("<p style='text-align: center;'><strong>Implied Share Price</strong></p>", unsafe_allow_html=True)
+                with col_price3:
+                    upside = (implied_price - current_price) / current_price * 100
+                    color = "green" if upside > 0 else "red"
+                    st.metric("Upside/Downside", f"{upside:+.1f}%")
+
+                # === Sensitivity Analysis ===
+                st.markdown("### Sensitivity Analysis")
+                st.caption("See how implied share price changes with different WACC assumptions")
+
+                wacc_low = st.number_input("Low WACC (%)", value=(wacc*100 - 1.5), step=0.25, key="wacc_low") / 100
+                wacc_high = st.number_input("High WACC (%)", value=(wacc*100 + 1.5), step=0.25, key="wacc_high") / 100
+
+                sensitivity_results = []
+                for w in [wacc_low, wacc, wacc_high]:
+                    proj_copy = build_dcf_projections(
+                        ltm_revenue, most_recent_date,
+                        growth_rates, ebit_margins, reinv_rates, eff_tax_rate
+                    )
+                    val = calculate_dcf_valuation(
+                        proj_copy, w, terminal_growth,
+                        total_debt, total_cash, shares_outstanding
+                    )
+                    sensitivity_results.append({
+                        'WACC': f"{w:.2%}",
+                        'Enterprise Value': f"{val['enterprise_value']/scale_factor:,.2f}",
+                        'Equity Value': f"{val['equity_value']/scale_factor:,.2f}",
+                        'Share Price': f"${val['share_price']:,.2f}",
+                        'vs Current': f"{((val['share_price'] - current_price) / current_price * 100):+.1f}%"
+                    })
+
+                sensitivity_df = pd.DataFrame(sensitivity_results)
+                st.dataframe(sensitivity_df, use_container_width=True, hide_index=True)
+
+                # === Summary Table ===
+                st.markdown("### Valuation Summary")
+                summary_data = {
+                    "Metric": [
+                        "LTM Revenue",
+                        "Projection Period",
+                        "WACC",
+                        "Terminal Growth Rate",
+                        "Effective Tax Rate",
+                        "PV of FCFs",
+                        "Terminal Value",
+                        "PV of Terminal Value",
+                        "Enterprise Value",
+                        "Less: Total Debt",
+                        "Plus: Total Cash",
+                        "Equity Value",
+                        "Shares Outstanding",
+                        "Implied Share Price",
+                        "Current Market Price",
+                        "Upside/Downside"
+                    ],
+                    "Value": [
+                        f"{ltm_revenue/scale_factor:,.2f} {scale_name}",
+                        f"{time_horizon} years",
+                        f"{wacc:.2%}",
+                        f"{terminal_growth:.2%}",
+                        f"{eff_tax_rate:.2%}",
+                        f"{valuation['pv_fcf']/scale_factor:,.2f} {scale_name}",
+                        f"{valuation['terminal_value']/scale_factor:,.2f} {scale_name}",
+                        f"{valuation['pv_terminal']/scale_factor:,.2f} {scale_name}",
+                        f"{valuation['enterprise_value']/scale_factor:,.2f} {scale_name}",
+                        f"({total_debt/scale_factor:,.2f}) {scale_name}",
+                        f"{total_cash/scale_factor:,.2f} {scale_name}",
+                        f"{valuation['equity_value']/scale_factor:,.2f} {scale_name}",
+                        f"{shares_outstanding/1e6:,.2f}M",
+                        f"${implied_price:,.2f}",
+                        f"${current_price:,.2f}",
+                        f"{upside:+.1f}%"
+                    ]
+                }
+                summary_df = pd.DataFrame(summary_data)
+                st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
+                st.info("Please check that the ticker symbol is valid and has sufficient financial data.")
+
+# ============================================================================
+# Main App with Tabs
+# ============================================================================
+
+# Title
+st.title("📊 DCF Equity Valuation")
+
+# Create tabs
+tab_home, tab_wacc, tab_historical, tab_dcf = st.tabs([
+    "🏠 Home",
+    "1️⃣ WACC Calculator",
+    "2️⃣ Historical Analysis",
+    "3️⃣ DCF Model"
+])
+
+with tab_home:
+    render_home()
+
+with tab_wacc:
+    render_wacc()
+
+with tab_historical:
+    render_historical()
+
+with tab_dcf:
+    render_dcf()
