@@ -988,6 +988,8 @@ def render_wacc():
 
                 # Calculate WACC
                 wacc = (w_E * cost_of_equity) + (w_D * cost_of_debt * (1 - marg_tax_rate))
+                st.session_state["wacc_calculated_ticker"] = ticker_symbol
+                st.session_state["wacc_calculated_rate"] = wacc
 
                 # Display results
                 col1, col2 = st.columns(2)
@@ -1039,6 +1041,8 @@ def render_wacc():
                     terminal_growth, average_reinvestment, average_return_on_capital, growth_method = calculate_terminal_growth_rate(
                         historical_data, wacc
                     )
+                    st.session_state["wacc_terminal_growth_ticker"] = ticker_symbol
+                    st.session_state["wacc_terminal_growth_rate"] = terminal_growth
                     st.session_state["dcf_terminal_growth_rate"] = terminal_growth * 100
                     st.session_state["dcf_wacc_rate"] = wacc * 100
 
@@ -1250,6 +1254,11 @@ def render_dcf():
             ):
                 default_value = f"{projection_defaults[column] * 100:.2f}"
                 st.session_state[key] = default_value
+
+            if st.session_state.get("wacc_calculated_ticker") == ticker_symbol:
+                st.session_state["dcf_wacc_rate"] = st.session_state["wacc_calculated_rate"] * 100
+            if st.session_state.get("wacc_terminal_growth_ticker") == ticker_symbol:
+                st.session_state["dcf_terminal_growth_rate"] = st.session_state["wacc_terminal_growth_rate"] * 100
         st.session_state["dcf_tax_ticker"] = ticker_symbol
 
     with col2:
