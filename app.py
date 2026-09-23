@@ -424,17 +424,14 @@ def calculate_terminal_growth_rate(historical_data, wacc):
     return recommended_growth, average_reinvestment, average_return_on_capital, method
 
 
-def get_projection_defaults(ticker_symbol):
-    """Return historical-average projection assumptions for a ticker."""
+def get_projection_defaults_from_data(historical_data):
+    """Return historical-average projection assumptions from saved analysis data."""
     fallback_values = {
         'Revenue Growth': 0.10,
         'EBIT Margin': 0.30,
         'Reinv Rate': 0.25,
     }
-    try:
-        stats = get_historical_data(ticker_symbol)['df_stats'].replace([np.inf, -np.inf], np.nan)
-    except Exception:
-        return fallback_values
+    stats = historical_data['df_stats'].replace([np.inf, -np.inf], np.nan)
 
     defaults = {}
     for column, fallback in fallback_values.items():
@@ -443,20 +440,34 @@ def get_projection_defaults(ticker_symbol):
     return defaults
 
 
-def expand_projection_input(raw_value, label):
-    """Expand one, two, or ten entered assumptions into a ten-year pattern."""
+def get_projection_defaults(ticker_symbol):
+    """Fetch and return historical-average projection assumptions for a ticker."""
+    try:
+        return get_projection_defaults_from_data(get_historical_data(ticker_symbol))
+    except Exception:
+        return {
+            'Revenue Growth': 0.10,
+            'EBIT Margin': 0.30,
+            'Reinv Rate': 0.25,
+        }
+
+
+def expand_projection_input(raw_value, label, horizon=None):
+    """Expand one input to a fixed horizon or return comma-separated yearly values."""
     try:
         values = [float(value.strip()) / 100 for value in raw_value.split(',') if value.strip()]
     except ValueError as error:
         raise ValueError(f"{label} must contain valid comma-separated numbers.") from error
 
-    if len(values) == 1:
-        return values * 10
-    if len(values) == 2:
-        return [values[0]] * 5 + [values[1]] * 5
-    if len(values) == 10:
+    if not values:
+        raise ValueError(f"{label} must contain at least one value.")
+    if horizon is None:
         return values
-    raise ValueError(f"{label} must contain 1, 2, or 10 values (years 1-5 and 6-10).")
+    if len(values) == 1:
+        return values * horizon
+    if len(values) == horizon:
+        return values
+    raise ValueError(f"{label} must contain one value or exactly {horizon} yearly values.")
 
 
 def get_ltm_revenue(ticker_symbol):
@@ -716,6 +727,8 @@ def render_wacc():
                 # Estimate sustainable terminal growth from historical fundamentals.
                 try:
                     historical_data = get_historical_data(ticker_symbol)
+                    st.session_state["historical_analysis_data"] = historical_data
+                    st.session_state["historical_analysis_ticker"] = ticker_symbol
                     terminal_growth, average_reinvestment, average_return_on_capital, growth_method = calculate_terminal_growth_rate(
                         historical_data, wacc
                     )
@@ -723,7 +736,7 @@ def render_wacc():
                     st.session_state["dcf_wacc_rate"] = wacc * 100
 
                     st.markdown("**Terminal Growth Rate**")
-                    st.latex(r"g = Reinvestment	ext{ Rate} \times Return	ext{ on Capital}")
+                    st.latex(r"g = Reinvestment\text{ Rate} \times Return\text{ on Capital}")
                     growth_col1, growth_col2, growth_col3 = st.columns(3)
                     with growth_col1:
                         st.metric("Average Reinvestment Rate", f"{average_reinvestment:.2%}")
@@ -783,6 +796,8 @@ def render_historical():
                 st.subheader(f"{company_name} ({ticker_symbol})")
 
                 data = get_historical_data(ticker_symbol)
+                st.session_state["historical_analysis_data"] = data
+                st.session_state["historical_analysis_ticker"] = ticker_symbol
                 income_statement = data['income_statement']
                 balance_sheet = data['balance_sheet']
                 merged_cf = data['merged_cf']
@@ -906,14 +921,19 @@ def render_dcf():
     if st.session_state.get("dcf_tax_ticker") != ticker_symbol:
         with st.spinner(f"Loading tax rate for {ticker_symbol}..."):
             st.session_state["dcf_effective_tax_rate"] = get_effective_tax_rate(ticker_symbol) * 100
-            projection_defaults = get_projection_defaults(ticker_symbol)
+            saved_historical_data = st.session_state.get("historical_analysis_data")
+            saved_historical_ticker = st.session_state.get("historical_analysis_ticker")
+            if saved_historical_ticker == ticker_symbol and saved_historical_data is not None:
+                projection_defaults = get_projection_defaults_from_data(saved_historical_data)
+            else:
+                projection_defaults = get_projection_defaults(ticker_symbol)
             for key, column in (
                 ("dcf_growth_input", "Revenue Growth"),
                 ("dcf_margin_input", "EBIT Margin"),
                 ("dcf_reinvestment_input", "Reinv Rate"),
             ):
                 default_value = f"{projection_defaults[column] * 100:.2f}"
-                st.session_state[key] = f"{default_value}, {default_value}"
+                st.session_state[key] = default_value
         st.session_state["dcf_tax_ticker"] = ticker_symbol
 
     with col2:
@@ -947,7 +967,14 @@ def render_dcf():
 
     # === Section 2: Projection Assumptions ===
     st.markdown("### Projection Assumptions")
-    st.caption("Auto-filled from historical averages. Enter 1 value for all 10 years, 2 values for years 1-5 and 6-10, or 10 values year-by-year.")
+    horizon_mode = st.selectbox(
+        "Projection Horizon",
+        options=["1 year", "5 years", "10 years", "Custom comma-separated"],
+        index=2,
+        key="dcf_horizon_mode",
+        help="Fixed horizons repeat one assumption. Custom mode uses one value per comma-separated year.",
+    )
+    st.caption("Auto-filled from Historical Analysis when the ticker matches. Enter one value for a fixed horizon or comma-separated values in Custom mode.")
 
     col_a, col_b, col_c = st.columns(3)
 
@@ -974,17 +1001,22 @@ def render_dcf():
 
     # Parse inputs
     try:
-        growth_rates = expand_projection_input(growth_input, "Revenue growth rates")
-        ebit_margins = expand_projection_input(margin_input, "EBIT margins")
-        reinv_rates = expand_projection_input(reinv_input, "Reinvestment rates")
+        if horizon_mode == "Custom comma-separated":
+            growth_rates = expand_projection_input(growth_input, "Revenue growth rates")
+            ebit_margins = expand_projection_input(margin_input, "EBIT margins")
+            reinv_rates = expand_projection_input(reinv_input, "Reinvestment rates")
+            if not (len(growth_rates) == len(ebit_margins) == len(reinv_rates)):
+                st.error("Custom projection inputs must contain the same number of yearly values.")
+                return
+            time_horizon = len(growth_rates)
+        else:
+            time_horizon = int(horizon_mode.split()[0])
+            growth_rates = expand_projection_input(growth_input, "Revenue growth rates", time_horizon)
+            ebit_margins = expand_projection_input(margin_input, "EBIT margins", time_horizon)
+            reinv_rates = expand_projection_input(reinv_input, "Reinvestment rates", time_horizon)
 
-        time_horizon = len(growth_rates)
-        if time_horizon < 5:
-            st.error(
-                "Use at least 5 explicit forecast years. A one-year DCF treats that year's FCF as perpetual, "
-                "which can materially understate cyclical companies such as TXN."
-            )
-            return
+        if time_horizon == 1:
+            st.warning("A one-year DCF treats that year's FCF as perpetual; use it as a quick scenario, not a normalized valuation.")
         st.caption(f"Projection period: {time_horizon} years")
 
     except ValueError:
