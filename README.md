@@ -2,7 +2,7 @@
 
 A Streamlit web application for Discounted Cash Flow (DCF) equity valuation. Value any publicly traded company by computing WACC, analyzing historical financials, and building a complete DCF model.
 
-**Built for MGT6534 at Vanderbilt University**
+
 
 ## Live Demo
 
@@ -83,4 +83,4 @@ MIT License - Free to use for educational purposes
 
 ## Author
 
-Jesse Blocher - Vanderbilt University
+Caden Patel - Vanderbilt University
