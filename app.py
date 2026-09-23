@@ -232,27 +232,29 @@ def get_wacc_input_defaults(ticker_symbol):
 
     # EMRP is a market-wide assumption, not a company-specific input.
     equity_market_risk_premium = 0.05
-    marginal_tax_rate = None
+    return risk_free_rate, equity_market_risk_premium, get_effective_tax_rate(ticker_symbol)
+
+
+def get_effective_tax_rate(ticker_symbol):
+    """Return one shared ticker tax-rate estimate for WACC and DCF calculations."""
+    tax_rate = None
     try:
         ticker_info = yf.Ticker(ticker_symbol).info
-        marginal_tax_rate = _non_negative_number(ticker_info.get("taxRateForCalcs"))
+        tax_rate = _non_negative_number(ticker_info.get("taxRateForCalcs"))
     except Exception:
         pass
 
-    if marginal_tax_rate is None or marginal_tax_rate > 0.5:
+    if tax_rate is None or tax_rate > 0.5:
         try:
             historical_data = get_historical_data(ticker_symbol)
             tax_rates = historical_data["df_stats"]["Eff Tax Rate"].replace([np.inf, -np.inf], np.nan).dropna()
             usable_tax_rates = tax_rates[(tax_rates >= 0) & (tax_rates <= 0.5)]
             if not usable_tax_rates.empty:
-                marginal_tax_rate = float(usable_tax_rates.iloc[-1])
+                tax_rate = float(usable_tax_rates.iloc[-1])
         except Exception:
             pass
 
-    if marginal_tax_rate is None or marginal_tax_rate > 0.5:
-        marginal_tax_rate = 0.25
-
-    return risk_free_rate, equity_market_risk_premium, marginal_tax_rate
+    return tax_rate if tax_rate is not None and tax_rate <= 0.5 else 0.21
 
 
 def calculate_beta(ticker_symbol, index_symbol="^GSPC"):
@@ -858,6 +860,11 @@ def render_dcf():
     with col1:
         ticker_symbol = st.text_input("Ticker Symbol", value="MSFT", key="dcf_ticker").upper()
 
+    if st.session_state.get("dcf_tax_ticker") != ticker_symbol:
+        with st.spinner(f"Loading tax rate for {ticker_symbol}..."):
+            st.session_state["dcf_effective_tax_rate"] = get_effective_tax_rate(ticker_symbol) * 100
+        st.session_state["dcf_tax_ticker"] = ticker_symbol
+
     with col2:
         wacc = st.number_input(
             "WACC (%)",
@@ -877,8 +884,8 @@ def render_dcf():
     with col4:
         eff_tax_rate = st.number_input(
             "Effective Tax Rate (%)",
-            min_value=0.0, max_value=50.0, value=21.0, step=1.0,
-            help="From Historical Analysis tab"
+            min_value=0.0, max_value=50.0, step=1.0, key="dcf_effective_tax_rate",
+            help="Auto-populated from the same ticker tax-rate resolver used by the WACC tab"
         ) / 100
 
     with col5:
