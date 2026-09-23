@@ -514,6 +514,7 @@ def get_historical_data(ticker_symbol):
         income_statement,
         ['Total Revenue', 'Operating Revenue'],
     ).dropna().sort_index()
+    revenue_growth = revenue_for_window.pct_change()
     historical_periods = revenue_for_window.index[-5:]
     income_statement = income_statement.reindex(historical_periods)
     balance_sheet = balance_sheet.reindex(historical_periods)
@@ -534,7 +535,7 @@ def get_historical_data(ticker_symbol):
     income_statement['Gross Profit'] = gross_profit
     income_statement['Gross Margin'] = income_statement['Gross Profit'] / income_statement['Total Revenue']
     income_statement['EBIT Margin'] = income_statement['EBIT'] / income_statement['Total Revenue']
-    income_statement['Revenue Growth'] = income_statement['Total Revenue'].pct_change()
+    income_statement['Revenue Growth'] = revenue_growth.reindex(income_statement.index)
     income_statement['Revenue Growth Change'] = income_statement['Revenue Growth'].diff()
     income_statement['EBIT Growth'] = income_statement['EBIT'].pct_change()
 
