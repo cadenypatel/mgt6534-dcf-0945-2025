@@ -311,6 +311,7 @@ def get_historical_data(ticker_symbol):
     income_statement['Gross Margin'] = income_statement['Gross Profit'] / income_statement['Total Revenue']
     income_statement['EBIT Margin'] = income_statement['EBIT'] / income_statement['Total Revenue']
     income_statement['Revenue Growth'] = income_statement['Total Revenue'].pct_change()
+    income_statement['Revenue Growth Change'] = income_statement['Revenue Growth'].diff()
     income_statement['EBIT Growth'] = income_statement['EBIT'].pct_change()
 
     # Get effective tax rate
