@@ -787,17 +787,26 @@ def render_historical():
 
     analyze_button = st.button("Analyze Financials", type="primary")
 
-    if analyze_button:
+    saved_data = st.session_state.get("historical_analysis_data")
+    saved_ticker = st.session_state.get("historical_analysis_ticker")
+    has_saved_analysis = saved_data is not None and saved_ticker == ticker_symbol
+
+    if analyze_button or has_saved_analysis:
         with st.spinner(f"Fetching financial data for {ticker_symbol}..."):
             try:
-                ticker = yf.Ticker(ticker_symbol)
-                company_name = ticker.info.get('longName', ticker_symbol)
+                if analyze_button:
+                    ticker = yf.Ticker(ticker_symbol)
+                    company_name = ticker.info.get('longName', ticker_symbol)
+                    data = get_historical_data(ticker_symbol)
+                    st.session_state["historical_analysis_data"] = data
+                    st.session_state["historical_analysis_ticker"] = ticker_symbol
+                    st.session_state["historical_analysis_company"] = company_name
+                else:
+                    data = saved_data
+                    company_name = st.session_state.get("historical_analysis_company", ticker_symbol)
 
                 st.subheader(f"{company_name} ({ticker_symbol})")
 
-                data = get_historical_data(ticker_symbol)
-                st.session_state["historical_analysis_data"] = data
-                st.session_state["historical_analysis_ticker"] = ticker_symbol
                 income_statement = data['income_statement']
                 balance_sheet = data['balance_sheet']
                 merged_cf = data['merged_cf']
