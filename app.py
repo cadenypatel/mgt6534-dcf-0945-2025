@@ -479,15 +479,20 @@ def get_sec_historical_statements(ticker_symbol):
     return income_statement, balance_sheet, cash_flows
 
 
+def _get_yahoo_historical_statements(ticker_symbol):
+    """Fetch Yahoo annual statements for companies with incomplete SEC coverage."""
+    ticker = yf.Ticker(ticker_symbol)
+    return ticker.financials.T.sort_index(), ticker.balance_sheet.T.sort_index(), ticker.cashflow.T.sort_index()
+
+
 def get_historical_data(ticker_symbol):
     """Fetch and process historical financial data, preferring SEC annual filings."""
+    using_sec = True
     try:
         income_statement, balance_sheet, cash_flows = get_sec_historical_statements(ticker_symbol)
     except Exception:
-        ticker = yf.Ticker(ticker_symbol)
-        income_statement = ticker.financials.T.sort_index()
-        balance_sheet = ticker.balance_sheet.T.sort_index()
-        cash_flows = ticker.cashflow.T.sort_index()
+        using_sec = False
+        income_statement, balance_sheet, cash_flows = _get_yahoo_historical_statements(ticker_symbol)
 
     cash_flow_fields = {
         "Capital Expenditure": ["Capital Expenditure"],
@@ -515,6 +520,24 @@ def get_historical_data(ticker_symbol):
         income_statement,
         ['Total Revenue', 'Operating Revenue'],
     ).dropna().sort_index()
+    target_years = set(range(2021, 2026))
+    available_target_periods = revenue_for_window.index[
+        revenue_for_window.index.year.isin(target_years)
+    ]
+    if using_sec and len(available_target_periods) != len(target_years):
+        try:
+            income_statement, balance_sheet, cash_flows = _get_yahoo_historical_statements(ticker_symbol)
+            using_sec = False
+            revenue_for_window = _statement_series(
+                income_statement,
+                ['Total Revenue', 'Operating Revenue'],
+            ).dropna().sort_index()
+            available_target_periods = revenue_for_window.index[
+                revenue_for_window.index.year.isin(target_years)
+            ]
+        except Exception:
+            pass
+
     revenue_growth = revenue_for_window.pct_change().replace([np.inf, -np.inf], np.nan)
     revenue_growth_change = revenue_growth.diff()
     ebit_for_growth = _statement_series(
@@ -522,16 +545,13 @@ def get_historical_data(ticker_symbol):
         ['EBIT', 'Operating Income'],
     ).dropna().sort_index()
     ebit_growth = ebit_for_growth.pct_change().replace([np.inf, -np.inf], np.nan)
-    target_years = set(range(2021, 2026))
-    historical_periods = revenue_for_window.index[
-        revenue_for_window.index.year.isin(target_years)
-    ]
+    historical_periods = available_target_periods
     historical_periods = historical_periods[~historical_periods.year.duplicated(keep='last')]
-    if len(historical_periods) != len(target_years):
-        raise ValueError(
-            f"SEC historical data for {ticker_symbol} does not contain complete fiscal years 2021-2025."
-        )
-    prior_period = revenue_for_window.index[revenue_for_window.index.year < 2021][-1:]
+    if len(historical_periods) < 2:
+        historical_periods = revenue_for_window.index[-5:]
+    if len(historical_periods) < 2:
+        raise ValueError(f"No sufficient annual revenue history was returned for {ticker_symbol}.")
+    prior_period = revenue_for_window.index[revenue_for_window.index < historical_periods[0]][-1:]
     balance_periods = prior_period.append(historical_periods)
     income_statement = income_statement.reindex(historical_periods)
     balance_sheet = balance_sheet.reindex(balance_periods)
@@ -545,6 +565,22 @@ def get_historical_data(ticker_symbol):
     income_statement['EBIT'] = _statement_series(
         income_statement, ['EBIT', 'Operating Income']
     )
+    if income_statement['EBIT'].isna().all():
+        net_income = _statement_series(
+            income_statement,
+            ['Net Income', 'Net Income Common Stockholders'],
+        )
+        pretax_income = _statement_series(income_statement, ['Pretax Income'])
+        interest_expense = _statement_series(
+            income_statement,
+            ['Interest Expense', 'Interest Expense Non Operating'],
+        )
+        if net_income.notna().any():
+            income_statement['EBIT'] = net_income
+        elif pretax_income.notna().any() and interest_expense.notna().any():
+            income_statement['EBIT'] = pretax_income + interest_expense
+        else:
+            income_statement['EBIT'] = pretax_income
     gross_profit = _statement_series(income_statement, ['Gross Profit'])
     if gross_profit.isna().all():
         cost_of_revenue = _statement_series(income_statement, ['Cost Of Revenue'])
@@ -559,6 +595,12 @@ def get_historical_data(ticker_symbol):
     income_statement['Revenue Growth'] = revenue_growth.reindex(income_statement.index).fillna(0.0)
     income_statement['Revenue Growth Change'] = revenue_growth_change.reindex(income_statement.index).fillna(0.0)
     income_statement['EBIT Growth'] = ebit_growth.reindex(income_statement.index).fillna(0.0)
+    if income_statement['EBIT Growth'].eq(0).all() and income_statement['EBIT'].notna().sum() > 1:
+        income_statement['EBIT Growth'] = (
+            income_statement['EBIT'].pct_change()
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+        )
 
     # Get effective tax rate
     if 'Tax Rate For Calcs' in income_statement.columns:
