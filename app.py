@@ -118,16 +118,17 @@ def _latest_statement_value(statement, names):
 
 
 def _average_annual_growth(series):
-    """Compute the mean yearly percentage change, including both increases and decreases."""
+    """Compute the average year-to-year change in the revenue growth rate."""
     values = pd.to_numeric(series, errors="coerce").dropna()
     if values.empty or len(values) < 2:
         return 0.0
 
     yoy_growth = values.pct_change().dropna()
-    if yoy_growth.empty:
+    growth_rate_changes = yoy_growth.diff().dropna()
+    if growth_rate_changes.empty:
         return 0.0
 
-    return float(yoy_growth.mean())
+    return float(growth_rate_changes.mean())
 
 
 def get_company_market_data(ticker_symbol):
@@ -450,13 +451,12 @@ def get_projection_defaults_from_data(historical_data):
 
     defaults = {}
     for column, fallback in fallback_values.items():
-        if column == 'Revenue Growth':
-            revenue_series = income_statement.get('Total Revenue') if isinstance(income_statement, pd.DataFrame) else None
-            defaults[column] = _average_annual_growth(revenue_series) if revenue_series is not None else fallback
-            continue
-
         values = stats[column].dropna()
         defaults[column] = float(values.mean()) if not values.empty else fallback
+    revenue_series = income_statement.get('Total Revenue') if isinstance(income_statement, pd.DataFrame) else None
+    if revenue_series is not None:
+        defaults['Revenue Growth'] = _average_annual_growth(revenue_series)
+
     return defaults
 
 
