@@ -672,8 +672,8 @@ def calculate_terminal_growth_rate(historical_data, wacc):
         raw_growth = 0.03
         method = 'Default long-term growth assumption'
 
-    # Keep the Gordon Growth Model stable: terminal growth must remain below WACC.
-    maximum_growth = min(0.05, max(0.0, wacc - 0.005))
+    # Keep terminal value from dominating when growth approaches the discount rate.
+    maximum_growth = min(0.03, max(0.0, wacc - 0.02))
     recommended_growth = min(max(float(raw_growth), 0.0), maximum_growth)
     return recommended_growth, average_reinvestment, average_return_on_capital, method
 
@@ -850,6 +850,8 @@ def calculate_dcf_valuation(projections, wacc, terminal_growth, total_debt, tota
         raise ValueError("WACC must be greater than 0%.")
     if terminal_growth < 0 or terminal_growth >= wacc:
         raise ValueError("Terminal growth must be non-negative and lower than WACC.")
+    if wacc - terminal_growth < 0.02:
+        raise ValueError("Terminal growth must be at least 2 percentage points below WACC.")
     if shares_outstanding <= 0:
         raise ValueError("Shares outstanding must be greater than zero.")
 
@@ -1078,7 +1080,7 @@ def render_wacc():
                         st.metric("Average Return on Capital", f"{average_return_on_capital:.2%}")
                     with growth_col3:
                         st.metric("Recommended Terminal Growth", f"{terminal_growth:.2%}")
-                    st.caption(f"{growth_method}. The recommended rate is capped at 5% and kept below WACC for model stability.")
+                    st.caption(f"{growth_method}. The recommended rate is capped at 3% and kept at least 2 points below WACC for model stability.")
                     st.info("This recommended terminal growth rate is now loaded into the DCF Model tab.")
                 except Exception as growth_error:
                     st.warning(f"WACC calculated, but terminal growth could not be estimated from historicals: {growth_error}")
