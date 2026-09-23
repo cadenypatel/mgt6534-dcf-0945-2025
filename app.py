@@ -97,6 +97,26 @@ def _positive_number(value):
         return None
 
 
+def _non_negative_number(value):
+    """Return a non-negative numeric value, preserving legitimate zeroes."""
+    try:
+        number = float(value)
+        return number if np.isfinite(number) and number >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _latest_statement_value(statement, names):
+    """Read the latest available value for one of several statement labels."""
+    for name in names:
+        if name not in statement.index:
+            continue
+        values = pd.to_numeric(statement.loc[name], errors="coerce").dropna()
+        if not values.empty:
+            return _non_negative_number(values.sort_index().iloc[-1])
+    return None
+
+
 def get_company_market_data(ticker_symbol):
     """Resolve core company data with fallbacks for hosted Yahoo responses."""
     ticker = yf.Ticker(ticker_symbol)
@@ -110,6 +130,11 @@ def get_company_market_data(ticker_symbol):
         fast_info = ticker.fast_info
     except Exception:
         fast_info = {}
+
+    try:
+        balance_sheet = ticker.balance_sheet
+    except Exception:
+        balance_sheet = pd.DataFrame()
 
     shares_outstanding = next(
         (
@@ -157,6 +182,26 @@ def get_company_market_data(ticker_symbol):
     if market_cap is None and current_price is not None and shares_outstanding is not None:
         market_cap = current_price * shares_outstanding
 
+    total_debt = _non_negative_number(ticker_info.get("totalDebt"))
+    if total_debt is None and not balance_sheet.empty:
+        total_debt = _latest_statement_value(balance_sheet, ["Total Debt"])
+        if total_debt is None:
+            long_term_debt = _latest_statement_value(
+                balance_sheet, ["Long Term Debt And Capital Lease Obligation"]
+            )
+            current_debt = _latest_statement_value(
+                balance_sheet, ["Current Debt And Capital Lease Obligation", "Current Debt"]
+            )
+            if long_term_debt is not None or current_debt is not None:
+                total_debt = (long_term_debt or 0) + (current_debt or 0)
+
+    total_cash = _non_negative_number(ticker_info.get("totalCash"))
+    if total_cash is None and not balance_sheet.empty:
+        total_cash = _latest_statement_value(
+            balance_sheet,
+            ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"],
+        )
+
     if shares_outstanding is None or market_cap is None:
         raise ValueError(
             f"Yahoo Finance did not return usable price and share data for {ticker_symbol}. "
@@ -167,8 +212,8 @@ def get_company_market_data(ticker_symbol):
         "company_name": ticker_info.get("longName", ticker_symbol),
         "market_cap": market_cap,
         "shares_outstanding": shares_outstanding,
-        "total_debt": _positive_number(ticker_info.get("totalDebt")) or 0,
-        "total_cash": _positive_number(ticker_info.get("totalCash")) or 0,
+        "total_debt": total_debt if total_debt is not None else 0,
+        "total_cash": total_cash if total_cash is not None else 0,
         "current_price": current_price,
     }
 
