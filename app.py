@@ -118,17 +118,21 @@ def _latest_statement_value(statement, names):
 
 
 def _average_annual_growth(series):
-    """Compute the average year-to-year change in the revenue growth rate."""
+    """Compute average YoY revenue growth, preferring positive growth if needed."""
     values = pd.to_numeric(series, errors="coerce").dropna()
     if values.empty or len(values) < 2:
         return 0.0
 
-    yoy_growth = values.pct_change().dropna()
-    growth_rate_changes = yoy_growth.diff().dropna()
-    if growth_rate_changes.empty:
+    yoy_growth = values.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    if yoy_growth.empty:
         return 0.0
 
-    return float(growth_rate_changes.mean())
+    average_growth = yoy_growth.mean()
+    if average_growth >= 0:
+        return float(average_growth)
+
+    positive_growth = yoy_growth[yoy_growth > 0]
+    return float(positive_growth.iloc[-1]) if not positive_growth.empty else 0.0
 
 
 def get_company_market_data(ticker_symbol):
