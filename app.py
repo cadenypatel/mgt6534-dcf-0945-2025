@@ -423,13 +423,21 @@ def get_historical_data(ticker_symbol):
 def calculate_terminal_growth_rate(historical_data, wacc):
     """Estimate sustainable terminal growth from historical reinvestment and ROC."""
     stats = historical_data['df_stats'].replace([np.inf, -np.inf], np.nan)
-    average_reinvestment = stats['Reinv Rate'].dropna().mean()
     average_return_on_capital = stats['Return on Capital'].dropna().mean()
+    income_statement = historical_data.get('income_statement', pd.DataFrame())
+    revenue_series = income_statement.get('Total Revenue') if isinstance(income_statement, pd.DataFrame) else None
 
-    if np.isfinite(average_reinvestment) and np.isfinite(average_return_on_capital):
+    if revenue_series is not None and np.isfinite(average_return_on_capital) and average_return_on_capital > 0:
+        average_revenue_growth = _average_annual_growth(revenue_series)
+        average_reinvestment = np.clip(
+            average_revenue_growth / average_return_on_capital,
+            0.0,
+            1.0,
+        )
         raw_growth = average_reinvestment * average_return_on_capital
-        method = 'Average reinvestment rate × average return on capital'
+        method = 'Normalized revenue growth ÷ average return on capital'
     else:
+        average_reinvestment = stats['Reinv Rate'].dropna().mean()
         raw_growth = stats['Revenue Growth'].dropna().mean()
         method = 'Average historical revenue growth (fallback)'
 
@@ -460,6 +468,13 @@ def get_projection_defaults_from_data(historical_data):
     revenue_series = income_statement.get('Total Revenue') if isinstance(income_statement, pd.DataFrame) else None
     if revenue_series is not None:
         defaults['Revenue Growth'] = _average_annual_growth(revenue_series)
+
+    average_return_on_capital = stats['Return on Capital'].dropna().mean()
+    if np.isfinite(average_return_on_capital) and average_return_on_capital > 0:
+        normalized_reinvestment = defaults['Revenue Growth'] / average_return_on_capital
+        defaults['Reinv Rate'] = float(np.clip(normalized_reinvestment, 0.0, 1.0))
+    else:
+        defaults['Reinv Rate'] = max(defaults['Reinv Rate'], 0.0)
 
     return defaults
 
