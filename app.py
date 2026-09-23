@@ -1012,7 +1012,7 @@ def render_dcf():
 
 # Shared visual shell
 inject_styles()
-st.markdown("<div class='brand-mark'>NORTHSTAR DCF / MGT6534</div>", unsafe_allow_html=True)
+st.markdown("<div class='brand-mark'>PATEL DCF</div>", unsafe_allow_html=True)
 
 # Create tabs
 tab_home, tab_wacc, tab_historical, tab_dcf = st.tabs([
