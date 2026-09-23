@@ -510,6 +510,15 @@ def get_historical_data(ticker_symbol):
         except Exception:
             pass
 
+    revenue_for_window = _statement_series(
+        income_statement,
+        ['Total Revenue', 'Operating Revenue'],
+    ).dropna().sort_index()
+    historical_periods = revenue_for_window.index[-5:]
+    income_statement = income_statement.reindex(historical_periods)
+    balance_sheet = balance_sheet.reindex(historical_periods)
+    cash_flows = cash_flows.reindex(historical_periods)
+
     # Normalize statement labels because Yahoo omits some lines for industries
     # such as biotech and uses alternate names for depreciation.
     income_statement['Total Revenue'] = _statement_series(
