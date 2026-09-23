@@ -328,6 +328,30 @@ def get_historical_data(ticker_symbol):
     df_stats['Reinvestment'] = merged_cf['Reinvestment']
     df_stats['Reinv Rate'] = merged_cf['Reinvestment'] / income_statement['NOPAT']
 
+    # Sustainable growth is driven by reinvestment and the return earned on
+    # the capital supporting the business.
+    total_debt = _statement_series(balance_sheet, ['Total Debt'], default=0)
+    if total_debt.eq(0).all():
+        long_term_debt = _statement_series(
+            balance_sheet, ['Long Term Debt And Capital Lease Obligation'], default=0
+        )
+        current_debt = _statement_series(
+            balance_sheet, ['Current Debt And Capital Lease Obligation', 'Current Debt'], default=0
+        )
+        total_debt = long_term_debt + current_debt
+    equity = _statement_series(
+        balance_sheet,
+        ['Stockholders Equity', 'Common Stock Equity', 'Total Equity Gross Minority Interest'],
+    )
+    cash = _statement_series(
+        balance_sheet,
+        ['Cash Cash Equivalents And Short Term Investments', 'Cash And Cash Equivalents'],
+        default=0,
+    )
+    invested_capital = total_debt + equity - cash
+    invested_capital = invested_capital.reindex(income_statement.index)
+    df_stats['Return on Capital'] = income_statement['NOPAT'] / invested_capital
+
     return {
         'income_statement': income_statement,
         'balance_sheet': balance_sheet,
@@ -335,6 +359,29 @@ def get_historical_data(ticker_symbol):
         'merged_cf': merged_cf,
         'df_stats': df_stats
     }
+
+
+def calculate_terminal_growth_rate(historical_data, wacc):
+    """Estimate sustainable terminal growth from historical reinvestment and ROC."""
+    stats = historical_data['df_stats'].replace([np.inf, -np.inf], np.nan)
+    average_reinvestment = stats['Reinv Rate'].dropna().mean()
+    average_return_on_capital = stats['Return on Capital'].dropna().mean()
+
+    if np.isfinite(average_reinvestment) and np.isfinite(average_return_on_capital):
+        raw_growth = average_reinvestment * average_return_on_capital
+        method = 'Average reinvestment rate × average return on capital'
+    else:
+        raw_growth = stats['Revenue Growth'].dropna().mean()
+        method = 'Average historical revenue growth (fallback)'
+
+    if not np.isfinite(raw_growth):
+        raw_growth = 0.03
+        method = 'Default long-term growth assumption'
+
+    # Keep the Gordon Growth Model stable: terminal growth must remain below WACC.
+    maximum_growth = min(0.05, max(0.0, wacc - 0.005))
+    recommended_growth = min(max(float(raw_growth), 0.0), maximum_growth)
+    return recommended_growth, average_reinvestment, average_return_on_capital, method
 
 def get_ltm_revenue(ticker_symbol):
     """Get Last Twelve Months revenue from quarterly data."""
@@ -569,6 +616,29 @@ def render_wacc():
 
                 st.markdown(f"<h1 style='text-align: center; color: #1f77b4;'>WACC = {wacc:.2%}</h1>", unsafe_allow_html=True)
 
+                # Estimate sustainable terminal growth from historical fundamentals.
+                try:
+                    historical_data = get_historical_data(ticker_symbol)
+                    terminal_growth, average_reinvestment, average_return_on_capital, growth_method = calculate_terminal_growth_rate(
+                        historical_data, wacc
+                    )
+                    st.session_state["dcf_terminal_growth_rate"] = terminal_growth * 100
+                    st.session_state["dcf_wacc_rate"] = wacc * 100
+
+                    st.markdown("**Terminal Growth Rate**")
+                    st.latex(r"g = Reinvestment	ext{ Rate} \times Return	ext{ on Capital}")
+                    growth_col1, growth_col2, growth_col3 = st.columns(3)
+                    with growth_col1:
+                        st.metric("Average Reinvestment Rate", f"{average_reinvestment:.2%}")
+                    with growth_col2:
+                        st.metric("Average Return on Capital", f"{average_return_on_capital:.2%}")
+                    with growth_col3:
+                        st.metric("Recommended Terminal Growth", f"{terminal_growth:.2%}")
+                    st.caption(f"{growth_method}. The recommended rate is capped at 5% and kept below WACC for model stability.")
+                    st.info("This recommended terminal growth rate is now loaded into the DCF Model tab.")
+                except Exception as growth_error:
+                    st.warning(f"WACC calculated, but terminal growth could not be estimated from historicals: {growth_error}")
+
                 # Summary table
                 st.markdown("**Summary**")
                 summary_df = pd.DataFrame({
@@ -726,6 +796,11 @@ def render_dcf():
     # === Section 1: Basic Inputs ===
     st.markdown("### Company & Valuation Inputs")
 
+    if "dcf_wacc_rate" not in st.session_state:
+        st.session_state["dcf_wacc_rate"] = 9.0
+    if "dcf_terminal_growth_rate" not in st.session_state:
+        st.session_state["dcf_terminal_growth_rate"] = 3.0
+
     col1, col2, col3 = st.columns(3)
 
     with col1:
@@ -734,15 +809,15 @@ def render_dcf():
     with col2:
         wacc = st.number_input(
             "WACC (%)",
-            min_value=1.0, max_value=30.0, value=9.0, step=0.25,
+            min_value=1.0, max_value=30.0, step=0.25, key="dcf_wacc_rate",
             help="From WACC Calculator tab"
         ) / 100
 
     with col3:
         terminal_growth = st.number_input(
             "Terminal Growth Rate (%)",
-            min_value=0.0, max_value=5.0, value=3.0, step=0.25,
-            help="Long-term sustainable growth rate (typically 2-3%)"
+            min_value=0.0, max_value=5.0, step=0.25, key="dcf_terminal_growth_rate",
+            help="Calculated in the WACC Calculator from historical reinvestment and return on capital"
         ) / 100
 
     col4, col5 = st.columns(2)
