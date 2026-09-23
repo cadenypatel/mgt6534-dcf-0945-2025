@@ -469,6 +469,13 @@ def calculate_dcf_valuation(projections, wacc, terminal_growth, total_debt, tota
     """Calculate DCF valuation and implied share price."""
     time_horizon = len(projections)
 
+    if wacc <= 0:
+        raise ValueError("WACC must be greater than 0%.")
+    if terminal_growth < 0 or terminal_growth >= wacc:
+        raise ValueError("Terminal growth must be non-negative and lower than WACC.")
+    if shares_outstanding <= 0:
+        raise ValueError("Shares outstanding must be greater than zero.")
+
     # Discount FCF to present
     projections['Discounted_FCF'] = projections['FCF'] / (1 + wacc) ** projections['T']
     pv_fcf = projections['Discounted_FCF'].sum()
@@ -938,6 +945,12 @@ def render_dcf():
             return
 
         time_horizon = len(growth_rates)
+        if time_horizon < 5:
+            st.error(
+                "Use at least 5 explicit forecast years. A one-year DCF treats that year's FCF as perpetual, "
+                "which can materially understate cyclical companies such as TXN."
+            )
+            return
         st.caption(f"Projection period: {time_horizon} years")
 
     except ValueError:
