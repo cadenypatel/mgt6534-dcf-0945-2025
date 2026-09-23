@@ -5,7 +5,7 @@ import yfinance as yf
 import statsmodels.api as sm
 
 # Page config
-st.set_page_config(page_title="Northstar DCF", page_icon="N", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="PATEL DCF", page_icon="N", layout="wide", initial_sidebar_state="collapsed")
 
 
 def inject_styles():
@@ -414,10 +414,10 @@ def render_home():
     st.markdown(
         """
         <section class="hero">
-            <div class="brand-mark">Northstar / Equity Research Workspace</div>
+            <div class="brand-mark">PATEL DCF / Equity Research Workspace</div>
             <div class="eyebrow">A disciplined view of value</div>
             <h1>Turn operating signals into an investable point of view.</h1>
-            <p>Northstar brings cost of capital, company history, and forward cash flow into one focused valuation workspace.</p>
+            <p>PATEL DCF brings cost of capital, company history, and forward cash flow into one focused valuation workspace.</p>
         </section>
         """,
         unsafe_allow_html=True,
