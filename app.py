@@ -5,7 +5,57 @@ import yfinance as yf
 import statsmodels.api as sm
 
 # Page config
-st.set_page_config(page_title="DCF Equity Valuation", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Northstar DCF", page_icon="N", layout="wide", initial_sidebar_state="collapsed")
+
+
+def inject_styles():
+    """Set the visual language for the valuation workspace."""
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap');
+
+        :root {
+            --ink: #17232b;
+            --muted: #66747a;
+            --paper: #f7f7f2;
+            --panel: #ffffff;
+            --line: #d9dfdc;
+            --teal: #0e766e;
+            --coral: #e56b54;
+        }
+
+        html, body, [class*="css"] { font-family: 'Manrope', sans-serif; }
+        .stApp { background: var(--paper); color: var(--ink); }
+        [data-testid="stHeader"] { background: transparent; }
+        [data-testid="stToolbar"] { right: 1rem; }
+        .block-container { max-width: 1180px; padding: 2.5rem 3rem 5rem; }
+        h1, h2, h3 { color: var(--ink); letter-spacing: -0.03em; }
+        h1 { font-weight: 800; font-size: clamp(2.4rem, 5vw, 4.8rem); line-height: .98; }
+        h2 { font-size: 2rem; }
+        h3 { font-size: 1.2rem; }
+        p, label, .stCaption { color: var(--muted); }
+        .brand-mark { color: var(--teal); font-family: 'DM Mono', monospace; font-size: .78rem; letter-spacing: .16em; text-transform: uppercase; margin-bottom: 1.25rem; }
+        .hero { border-bottom: 1px solid var(--line); padding: 1rem 0 2.5rem; margin-bottom: 1.25rem; }
+        .hero h1 { max-width: 760px; margin: 0; }
+        .hero p { max-width: 620px; font-size: 1.05rem; line-height: 1.7; margin: 1.25rem 0 0; }
+        .eyebrow { color: var(--coral); font-family: 'DM Mono', monospace; font-size: .72rem; letter-spacing: .12em; text-transform: uppercase; }
+        .stat-card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 1.15rem 1.25rem; min-height: 116px; }
+        .stat-card .label { color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .08em; }
+        .stat-card .value { color: var(--ink); font-size: 1.65rem; font-weight: 800; margin-top: .55rem; }
+        div[data-testid="stTabs"] > div:first-child { border-bottom: 1px solid var(--line); gap: .5rem; }
+        button[data-baseweb="tab"] { color: var(--muted); font-weight: 700; padding: .85rem 1rem; }
+        button[data-baseweb="tab"][aria-selected="true"] { color: var(--teal); }
+        div[data-testid="stMetric"] { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 1rem; }
+        div[data-testid="stMetricLabel"] p { font-size: .76rem; text-transform: uppercase; letter-spacing: .06em; }
+        .stButton > button[kind="primary"] { background: var(--teal); border: 0; border-radius: 6px; font-weight: 800; }
+        .stButton > button[kind="primary"]:hover { background: #095b55; }
+        [data-testid="stDataFrame"] { border: 1px solid var(--line); }
+        code { font-family: 'DM Mono', monospace; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # Credit spreads lookup table (from Damodaran, updated January 2025)
 CREDIT_SPREADS = [
@@ -36,6 +86,91 @@ def get_credit_spread(rating):
         if entry["Rating"].lower() == rating.lower():
             return entry["Spread"] / 100
     return None
+
+
+def _positive_number(value):
+    """Return a positive numeric value, or None for missing market data."""
+    try:
+        number = float(value)
+        return number if np.isfinite(number) and number > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def get_company_market_data(ticker_symbol):
+    """Resolve core company data with fallbacks for hosted Yahoo responses."""
+    ticker = yf.Ticker(ticker_symbol)
+
+    try:
+        ticker_info = ticker.info
+    except Exception:
+        ticker_info = {}
+
+    try:
+        fast_info = ticker.fast_info
+    except Exception:
+        fast_info = {}
+
+    shares_outstanding = next(
+        (
+            value for value in (
+                ticker_info.get("sharesOutstanding"),
+                fast_info.get("shares"),
+            )
+            if _positive_number(value) is not None
+        ),
+        None,
+    )
+    shares_outstanding = _positive_number(shares_outstanding)
+
+    current_price = next(
+        (
+            value for value in (
+                ticker_info.get("currentPrice"),
+                ticker_info.get("regularMarketPrice"),
+                fast_info.get("last_price"),
+            )
+            if _positive_number(value) is not None
+        ),
+        None,
+    )
+
+    if current_price is None:
+        try:
+            recent_prices = ticker.history(period="5d", auto_adjust=False)["Close"].dropna()
+            if not recent_prices.empty:
+                current_price = _positive_number(recent_prices.iloc[-1])
+        except Exception:
+            current_price = None
+
+    market_cap = next(
+        (
+            value for value in (
+                ticker_info.get("marketCap"),
+                fast_info.get("market_cap"),
+            )
+            if _positive_number(value) is not None
+        ),
+        None,
+    )
+    market_cap = _positive_number(market_cap)
+    if market_cap is None and current_price is not None and shares_outstanding is not None:
+        market_cap = current_price * shares_outstanding
+
+    if shares_outstanding is None or market_cap is None:
+        raise ValueError(
+            f"Yahoo Finance did not return usable price and share data for {ticker_symbol}. "
+            "Try again in a moment or check the ticker symbol."
+        )
+
+    return {
+        "company_name": ticker_info.get("longName", ticker_symbol),
+        "market_cap": market_cap,
+        "shares_outstanding": shares_outstanding,
+        "total_debt": _positive_number(ticker_info.get("totalDebt")) or 0,
+        "total_cash": _positive_number(ticker_info.get("totalCash")) or 0,
+        "current_price": current_price,
+    }
 
 def calculate_beta(ticker_symbol, index_symbol="^GSPC"):
     """Calculate beta using OLS regression on 5 years of monthly returns."""
@@ -194,38 +329,40 @@ def calculate_dcf_valuation(projections, wacc, terminal_growth, total_debt, tota
 # ============================================================================
 
 def render_home():
-    st.title("📊 DCF Equity Valuation")
-    st.markdown("### A Discounted Cash Flow Analysis Tool")
+    st.markdown(
+        """
+        <section class="hero">
+            <div class="brand-mark">Northstar / Equity Research Workspace</div>
+            <div class="eyebrow">A disciplined view of value</div>
+            <h1>Turn operating signals into an investable point of view.</h1>
+            <p>Northstar brings cost of capital, company history, and forward cash flow into one focused valuation workspace.</p>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    st.markdown("""
-    Welcome to the DCF Equity Valuation application. This tool helps you value
-    publicly traded companies using the Discounted Cash Flow methodology.
+    intro_col, signal_col = st.columns([1.6, 1], gap="large")
+    with intro_col:
+        st.markdown("#### Three lenses. One valuation.")
+        st.markdown(
+            "Move from market assumptions to business fundamentals, then test what the company could be worth. "
+            "Each stage leaves you with inputs you can carry into the next."
+        )
+    with signal_col:
+        st.markdown("<div class='stat-card'><div class='label'>Model architecture</div><div class='value'>WACC → FCF → EV</div><p>Transparent inputs, visible assumptions, no black box.</p></div>", unsafe_allow_html=True)
 
-    ---
+    st.markdown("<div style='height: 1.2rem'></div>", unsafe_allow_html=True)
+    step_cols = st.columns(3, gap="medium")
+    steps = [
+        ("01 / Capital", "WACC Calculator", "Estimate beta, cost of equity, cost of debt, and the discount rate."),
+        ("02 / Evidence", "Historical Analysis", "Read growth, margins, working capital, and reinvestment across reported periods."),
+        ("03 / Value", "DCF Model", "Project free cash flow, discount terminal value, and compare implied value with price."),
+    ]
+    for column, (eyebrow, title, description) in zip(step_cols, steps):
+        with column:
+            st.markdown(f"<div class='stat-card'><div class='eyebrow'>{eyebrow}</div><h3>{title}</h3><p>{description}</p></div>", unsafe_allow_html=True)
 
-    #### How to Use This App
-
-    Use the tabs above to navigate through the three stages of DCF analysis:
-
-    1. **WACC Calculator** - Calculate the Weighted Average Cost of Capital
-       - Estimates cost of equity using CAPM (beta from regression)
-       - Estimates cost of debt using risk-free rate + credit spread
-       - Computes weighted average based on capital structure
-
-    2. **Historical Analysis** - Analyze historical financial performance
-       - Revenue and EBIT growth rates
-       - Gross and EBIT margins
-       - Reinvestment rates and NOPAT
-
-    3. **DCF Model** - Build the valuation model *(coming soon)*
-       - Project future free cash flows
-       - Calculate terminal value
-       - Derive implied share price
-
-    ---
-
-    #### Key Formulas
-    """)
+    st.markdown("### The core mechanics")
 
     col1, col2 = st.columns(2)
 
@@ -243,8 +380,8 @@ def render_home():
         st.markdown("**Terminal Value**")
         st.latex(r"TV = \frac{FCF_{final} \times (1 + g)}{WACC - g}")
 
-    st.markdown("---")
-    st.caption("Built for MGT6534 | Data from Yahoo Finance")
+    st.markdown("<div style='height: .5rem'></div>", unsafe_allow_html=True)
+    st.caption("Built for MGT6534 | Market and financial statement data from Yahoo Finance")
 
 # ============================================================================
 # Page: WACC Calculator
@@ -284,16 +421,10 @@ def render_wacc():
     if calculate_button:
         with st.spinner(f"Fetching data for {ticker_symbol}..."):
             try:
-                ticker = yf.Ticker(ticker_symbol)
-                ticker_info = ticker.info
-
-                company_name = ticker_info.get('longName', ticker_symbol)
-                market_cap = ticker_info.get('marketCap', 0)
-                total_debt = ticker_info.get('totalDebt', 0)
-
-                if market_cap == 0:
-                    st.error(f"Could not retrieve market cap for {ticker_symbol}.")
-                    st.stop()
+                company_data = get_company_market_data(ticker_symbol)
+                company_name = company_data["company_name"]
+                market_cap = company_data["market_cap"]
+                total_debt = company_data["total_debt"]
 
                 st.subheader(f"{company_name} ({ticker_symbol})")
 
@@ -604,18 +735,12 @@ def render_dcf():
         with st.spinner(f"Running DCF valuation for {ticker_symbol}..."):
             try:
                 # Get company data
-                ticker = yf.Ticker(ticker_symbol)
-                ticker_info = ticker.info
-
-                company_name = ticker_info.get('longName', ticker_symbol)
-                shares_outstanding = ticker_info.get('sharesOutstanding', 0)
-                total_debt = ticker_info.get('totalDebt', 0)
-                total_cash = ticker_info.get('totalCash', 0)
-                current_price = ticker_info.get('currentPrice', ticker_info.get('regularMarketPrice', 0))
-
-                if shares_outstanding == 0:
-                    st.error(f"Could not retrieve shares outstanding for {ticker_symbol}.")
-                    return
+                company_data = get_company_market_data(ticker_symbol)
+                company_name = company_data["company_name"]
+                shares_outstanding = company_data["shares_outstanding"]
+                total_debt = company_data["total_debt"]
+                total_cash = company_data["total_cash"]
+                current_price = company_data["current_price"]
 
                 # Get LTM Revenue
                 ltm_revenue, most_recent_date = get_ltm_revenue(ticker_symbol)
@@ -803,8 +928,9 @@ def render_dcf():
 # Main App with Tabs
 # ============================================================================
 
-# Title
-st.title("📊 DCF Equity Valuation")
+# Shared visual shell
+inject_styles()
+st.markdown("<div class='brand-mark'>NORTHSTAR DCF / MGT6534</div>", unsafe_allow_html=True)
 
 # Create tabs
 tab_home, tab_wacc, tab_historical, tab_dcf = st.tabs([
