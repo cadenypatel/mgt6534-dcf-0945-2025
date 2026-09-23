@@ -217,6 +217,44 @@ def get_company_market_data(ticker_symbol):
         "current_price": current_price,
     }
 
+
+def get_wacc_input_defaults(ticker_symbol):
+    """Fetch current market assumptions and a ticker-specific tax-rate estimate."""
+    risk_free_rate = 0.045
+    try:
+        treasury_history = yf.Ticker("^TNX").history(period="5d", auto_adjust=False)["Close"].dropna()
+        if not treasury_history.empty:
+            treasury_yield = _positive_number(treasury_history.iloc[-1])
+            if treasury_yield is not None:
+                risk_free_rate = treasury_yield / 100
+    except Exception:
+        pass
+
+    # EMRP is a market-wide assumption, not a company-specific input.
+    equity_market_risk_premium = 0.05
+    marginal_tax_rate = None
+    try:
+        ticker_info = yf.Ticker(ticker_symbol).info
+        marginal_tax_rate = _non_negative_number(ticker_info.get("taxRateForCalcs"))
+    except Exception:
+        pass
+
+    if marginal_tax_rate is None or marginal_tax_rate > 0.5:
+        try:
+            historical_data = get_historical_data(ticker_symbol)
+            tax_rates = historical_data["df_stats"]["Eff Tax Rate"].replace([np.inf, -np.inf], np.nan).dropna()
+            usable_tax_rates = tax_rates[(tax_rates >= 0) & (tax_rates <= 0.5)]
+            if not usable_tax_rates.empty:
+                marginal_tax_rate = float(usable_tax_rates.iloc[-1])
+        except Exception:
+            pass
+
+    if marginal_tax_rate is None or marginal_tax_rate > 0.5:
+        marginal_tax_rate = 0.25
+
+    return risk_free_rate, equity_market_risk_premium, marginal_tax_rate
+
+
 def calculate_beta(ticker_symbol, index_symbol="^GSPC"):
     """Calculate beta using OLS regression on 5 years of monthly returns."""
     stock_data = yf.download(ticker_symbol, period='5y', interval='1mo', progress=False)['Close']
@@ -525,16 +563,27 @@ def render_wacc():
 
     with col1:
         ticker_symbol = st.text_input("Ticker Symbol", value="MSFT").upper()
+
+    if st.session_state.get("wacc_defaults_ticker") != ticker_symbol:
+        with st.spinner(f"Loading market assumptions for {ticker_symbol}..."):
+            risk_free_default, emrp_default, tax_default = get_wacc_input_defaults(ticker_symbol)
+        st.session_state["wacc_risk_free_rate"] = risk_free_default * 100
+        st.session_state["wacc_emrp"] = emrp_default * 100
+        st.session_state["wacc_tax_rate"] = tax_default * 100
+        st.session_state["wacc_defaults_ticker"] = ticker_symbol
+
+    with col1:
         risk_free_rate = st.number_input(
             "Risk-Free Rate (%)",
-            min_value=0.0, max_value=20.0, value=4.5, step=0.1,
-            help="Enter the current 10-year Treasury yield"
+            min_value=0.0, max_value=20.0, step=0.1, key="wacc_risk_free_rate",
+            help="Auto-populated from the latest 10-year Treasury yield (^TNX)"
         ) / 100
 
     with col2:
         emrp = st.number_input(
             "Equity Market Risk Premium (%)",
-            min_value=0.0, max_value=20.0, value=5.0, step=0.1
+            min_value=0.0, max_value=20.0, step=0.1, key="wacc_emrp",
+            help="Market-wide assumption, auto-populated at 5.0%; adjust if needed"
         ) / 100
         rating_options = [entry["Rating"] for entry in CREDIT_SPREADS]
         firm_rating = st.selectbox("Credit Rating", options=rating_options, index=0)
@@ -542,8 +591,11 @@ def render_wacc():
     with col3:
         marg_tax_rate = st.number_input(
             "Marginal Tax Rate (%)",
-            min_value=0.0, max_value=50.0, value=25.0, step=1.0
+            min_value=0.0, max_value=50.0, step=1.0, key="wacc_tax_rate",
+            help="Auto-populated from the ticker's latest usable tax rate"
         ) / 100
+
+    st.caption("Risk-free rate and tax rate refresh when the ticker changes. EMRP is a market-wide assumption and remains editable.")
 
     calculate_button = st.button("Calculate WACC", type="primary")
 
