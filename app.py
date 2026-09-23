@@ -183,7 +183,7 @@ def get_company_market_data(ticker_symbol):
         market_cap = current_price * shares_outstanding
 
     total_debt = _non_negative_number(ticker_info.get("totalDebt"))
-    if total_debt is None and not balance_sheet.empty:
+    if (total_debt is None or total_debt == 0) and not balance_sheet.empty:
         total_debt = _latest_statement_value(balance_sheet, ["Total Debt"])
         if total_debt is None:
             long_term_debt = _latest_statement_value(
@@ -196,7 +196,7 @@ def get_company_market_data(ticker_symbol):
                 total_debt = (long_term_debt or 0) + (current_debt or 0)
 
     total_cash = _non_negative_number(ticker_info.get("totalCash"))
-    if total_cash is None and not balance_sheet.empty:
+    if (total_cash is None or total_cash == 0) and not balance_sheet.empty:
         total_cash = _latest_statement_value(
             balance_sheet,
             ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"],
