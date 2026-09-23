@@ -444,6 +444,7 @@ def get_sec_historical_statements(ticker_symbol):
             "DepreciationDepletionAndAmortization",
             "DepreciationDepletionAndAmortizationPropertyPlantEquipment",
             "DepreciationAndAmortization",
+            "Depreciation",
         ],
     )
 
@@ -515,9 +516,25 @@ def get_historical_data(ticker_symbol):
         ['Total Revenue', 'Operating Revenue'],
     ).dropna().sort_index()
     revenue_growth = revenue_for_window.pct_change()
-    historical_periods = revenue_for_window.index[-5:]
+    revenue_growth_change = revenue_growth.diff()
+    ebit_for_growth = _statement_series(
+        income_statement,
+        ['EBIT', 'Operating Income'],
+    ).dropna().sort_index()
+    ebit_growth = ebit_for_growth.pct_change()
+    target_years = set(range(2021, 2026))
+    historical_periods = revenue_for_window.index[
+        revenue_for_window.index.year.isin(target_years)
+    ]
+    historical_periods = historical_periods[~historical_periods.year.duplicated(keep='last')]
+    if len(historical_periods) != len(target_years):
+        raise ValueError(
+            f"SEC historical data for {ticker_symbol} does not contain complete fiscal years 2021-2025."
+        )
+    prior_period = revenue_for_window.index[revenue_for_window.index.year < 2021][-1:]
+    balance_periods = prior_period.append(historical_periods)
     income_statement = income_statement.reindex(historical_periods)
-    balance_sheet = balance_sheet.reindex(historical_periods)
+    balance_sheet = balance_sheet.reindex(balance_periods)
     cash_flows = cash_flows.reindex(historical_periods)
 
     # Normalize statement labels because Yahoo omits some lines for industries
@@ -536,8 +553,8 @@ def get_historical_data(ticker_symbol):
     income_statement['Gross Margin'] = income_statement['Gross Profit'] / income_statement['Total Revenue']
     income_statement['EBIT Margin'] = income_statement['EBIT'] / income_statement['Total Revenue']
     income_statement['Revenue Growth'] = revenue_growth.reindex(income_statement.index)
-    income_statement['Revenue Growth Change'] = income_statement['Revenue Growth'].diff()
-    income_statement['EBIT Growth'] = income_statement['EBIT'].pct_change()
+    income_statement['Revenue Growth Change'] = revenue_growth_change.reindex(income_statement.index)
+    income_statement['EBIT Growth'] = ebit_growth.reindex(income_statement.index)
 
     # Get effective tax rate
     if 'Tax Rate For Calcs' in income_statement.columns:
@@ -565,6 +582,7 @@ def get_historical_data(ticker_symbol):
     balance_sheet["Adj CL"] = current_liabilities - current_debt
     balance_sheet["NWC"] = balance_sheet["Adj CA"] - balance_sheet["Adj CL"]
     balance_sheet["Ch in NWC"] = balance_sheet["NWC"].diff()
+    balance_sheet = balance_sheet.reindex(historical_periods)
 
     # Process cash flows
     cash_flows['Capital Expenditure'] = -_statement_series(
