@@ -117,6 +117,19 @@ def _latest_statement_value(statement, names):
     return None
 
 
+def _average_annual_growth(series):
+    """Compute the mean yearly percentage change, including both increases and decreases."""
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    if values.empty or len(values) < 2:
+        return 0.0
+
+    yoy_growth = values.pct_change().dropna()
+    if yoy_growth.empty:
+        return 0.0
+
+    return float(yoy_growth.mean())
+
+
 def get_company_market_data(ticker_symbol):
     """Resolve core company data with fallbacks for hosted Yahoo responses."""
     ticker = yf.Ticker(ticker_symbol)
@@ -433,9 +446,15 @@ def get_projection_defaults_from_data(historical_data):
         'Reinv Rate': 0.25,
     }
     stats = historical_data['df_stats'].replace([np.inf, -np.inf], np.nan)
+    income_statement = historical_data.get('income_statement', pd.DataFrame())
 
     defaults = {}
     for column, fallback in fallback_values.items():
+        if column == 'Revenue Growth':
+            revenue_series = income_statement.get('Total Revenue') if isinstance(income_statement, pd.DataFrame) else None
+            defaults[column] = _average_annual_growth(revenue_series) if revenue_series is not None else fallback
+            continue
+
         values = stats[column].dropna()
         defaults[column] = float(values.mean()) if not values.empty else fallback
     return defaults
@@ -472,14 +491,57 @@ def expand_projection_input(raw_value, label, horizon=None):
 
 
 def get_ltm_revenue(ticker_symbol):
-    """Get Last Twelve Months revenue from quarterly data."""
+    """Get a reliable LTM revenue from the latest four valid quarters."""
     ticker = yf.Ticker(ticker_symbol)
-    quarterly_data = ticker.quarterly_financials.T.sort_index()
-    ltm_data = quarterly_data.iloc[-4:]
-    revenue_column = 'Total Revenue' if 'Total Revenue' in ltm_data.columns else 'Operating Revenue'
-    ltm_revenue = ltm_data[revenue_column].sum()
-    most_recent_date = ltm_data.index[-1]
+
+    quarterly_data = None
+    for statement_getter in (
+        lambda: ticker.quarterly_income_stmt,
+        lambda: ticker.quarterly_financials,
+    ):
+        try:
+            statement = statement_getter()
+            if statement is not None and not statement.empty:
+                quarterly_data = statement.T.sort_index()
+                break
+        except Exception:
+            continue
+
+    if quarterly_data is None or quarterly_data.empty:
+        raise ValueError(f"No quarterly financial data was returned for {ticker_symbol}.")
+
+    revenue_column = None
+    for possible_column in ("Total Revenue", "Operating Revenue", "Revenue"):
+        if possible_column in quarterly_data.columns:
+            revenue_column = possible_column
+            break
+
+    if revenue_column is None:
+        available_columns = ", ".join(map(str, quarterly_data.columns))
+        raise ValueError(
+            f"Yahoo Finance did not return a usable revenue line for {ticker_symbol}. "
+            f"Available fields: {available_columns}"
+        )
+
+    revenue = pd.to_numeric(quarterly_data[revenue_column], errors="coerce").dropna().sort_index()
+    if revenue.empty:
+        raise ValueError(f"No usable revenue history was returned for {ticker_symbol}.")
+
+    revenue = revenue.tail(4)
+    if len(revenue) < 4:
+        raise ValueError(
+            f"Only {len(revenue)} usable quarters of revenue data were returned for {ticker_symbol}; "
+            "four quarters are required for LTM revenue."
+        )
+
+    ltm_revenue = float(revenue.sum())
+    most_recent_date = revenue.index[-1]
+
+    if not np.isfinite(ltm_revenue) or ltm_revenue <= 0:
+        raise ValueError(f"Invalid LTM revenue returned for {ticker_symbol}.")
+
     return ltm_revenue, most_recent_date
+
 
 def build_dcf_projections(ltm_revenue, most_recent_date, growth_rates, ebit_margins, reinv_rates, eff_tax_rate):
     """Build projections dataframe for DCF model."""
@@ -512,6 +574,7 @@ def build_dcf_projections(ltm_revenue, most_recent_date, growth_rates, ebit_marg
     projections['T'] = range(1, time_horizon + 1)
 
     return projections
+
 
 def calculate_dcf_valuation(projections, wacc, terminal_growth, total_debt, total_cash, shares_outstanding):
     """Calculate DCF valuation and implied share price."""
@@ -888,7 +951,7 @@ def render_historical():
                 avg_col1, avg_col2, avg_col3, avg_col4 = st.columns(4)
 
                 with avg_col1:
-                    avg_rev_growth = df_stats['Revenue Growth'].mean()
+                    avg_rev_growth = _average_annual_growth(income_statement['Total Revenue'])
                     st.metric("Avg Revenue Growth", f"{avg_rev_growth:.2%}")
 
                 with avg_col2:
