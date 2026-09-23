@@ -423,6 +423,42 @@ def calculate_terminal_growth_rate(historical_data, wacc):
     recommended_growth = min(max(float(raw_growth), 0.0), maximum_growth)
     return recommended_growth, average_reinvestment, average_return_on_capital, method
 
+
+def get_projection_defaults(ticker_symbol):
+    """Return historical-average projection assumptions for a ticker."""
+    fallback_values = {
+        'Revenue Growth': 0.10,
+        'EBIT Margin': 0.30,
+        'Reinv Rate': 0.25,
+    }
+    try:
+        stats = get_historical_data(ticker_symbol)['df_stats'].replace([np.inf, -np.inf], np.nan)
+    except Exception:
+        return fallback_values
+
+    defaults = {}
+    for column, fallback in fallback_values.items():
+        values = stats[column].dropna()
+        defaults[column] = float(values.mean()) if not values.empty else fallback
+    return defaults
+
+
+def expand_projection_input(raw_value, label):
+    """Expand one, two, or ten entered assumptions into a ten-year pattern."""
+    try:
+        values = [float(value.strip()) / 100 for value in raw_value.split(',') if value.strip()]
+    except ValueError as error:
+        raise ValueError(f"{label} must contain valid comma-separated numbers.") from error
+
+    if len(values) == 1:
+        return values * 10
+    if len(values) == 2:
+        return [values[0]] * 5 + [values[1]] * 5
+    if len(values) == 10:
+        return values
+    raise ValueError(f"{label} must contain 1, 2, or 10 values (years 1-5 and 6-10).")
+
+
 def get_ltm_revenue(ticker_symbol):
     """Get Last Twelve Months revenue from quarterly data."""
     ticker = yf.Ticker(ticker_symbol)
@@ -870,6 +906,14 @@ def render_dcf():
     if st.session_state.get("dcf_tax_ticker") != ticker_symbol:
         with st.spinner(f"Loading tax rate for {ticker_symbol}..."):
             st.session_state["dcf_effective_tax_rate"] = get_effective_tax_rate(ticker_symbol) * 100
+            projection_defaults = get_projection_defaults(ticker_symbol)
+            for key, column in (
+                ("dcf_growth_input", "Revenue Growth"),
+                ("dcf_margin_input", "EBIT Margin"),
+                ("dcf_reinvestment_input", "Reinv Rate"),
+            ):
+                default_value = f"{projection_defaults[column] * 100:.2f}"
+                st.session_state[key] = f"{default_value}, {default_value}"
         st.session_state["dcf_tax_ticker"] = ticker_symbol
 
     with col2:
@@ -903,46 +947,36 @@ def render_dcf():
 
     # === Section 2: Projection Assumptions ===
     st.markdown("### Projection Assumptions")
-    st.caption("Enter comma-separated values for each year of your projection period (e.g., 10 years)")
-
-    # Default values matching the notebook
-    default_growth = "20, 15, 15, 15, 10, 10, 10, 8, 8, 6"
-    default_margin = "46, 46, 46, 46, 46, 46, 46, 46, 46, 46"
-    default_reinv = "40, 40, 30, 20, 20, 20, 20, 20, 20, 20"
+    st.caption("Auto-filled from historical averages. Enter 1 value for all 10 years, 2 values for years 1-5 and 6-10, or 10 values year-by-year.")
 
     col_a, col_b, col_c = st.columns(3)
 
     with col_a:
         growth_input = st.text_input(
             "Revenue Growth Rates (%)",
-            value=default_growth,
-            help="Annual revenue growth rates for each projection year"
+            key="dcf_growth_input",
+            help="One value repeats across all years; two values map to years 1-5 and 6-10"
         )
 
     with col_b:
         margin_input = st.text_input(
             "EBIT Margins (%)",
-            value=default_margin,
-            help="EBIT margin for each projection year"
+            key="dcf_margin_input",
+            help="One value repeats across all years; two values map to years 1-5 and 6-10"
         )
 
     with col_c:
         reinv_input = st.text_input(
             "Reinvestment Rates (%)",
-            value=default_reinv,
-            help="Reinvestment rate for each projection year"
+            key="dcf_reinvestment_input",
+            help="One value repeats across all years; two values map to years 1-5 and 6-10"
         )
 
     # Parse inputs
     try:
-        growth_rates = [float(x.strip()) / 100 for x in growth_input.split(',')]
-        ebit_margins = [float(x.strip()) / 100 for x in margin_input.split(',')]
-        reinv_rates = [float(x.strip()) / 100 for x in reinv_input.split(',')]
-
-        # Validate lengths match
-        if not (len(growth_rates) == len(ebit_margins) == len(reinv_rates)):
-            st.error("All projection inputs must have the same number of values.")
-            return
+        growth_rates = expand_projection_input(growth_input, "Revenue growth rates")
+        ebit_margins = expand_projection_input(margin_input, "EBIT margins")
+        reinv_rates = expand_projection_input(reinv_input, "Reinvestment rates")
 
         time_horizon = len(growth_rates)
         if time_horizon < 5:
