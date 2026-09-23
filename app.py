@@ -192,6 +192,15 @@ def calculate_beta(ticker_symbol, index_symbol="^GSPC"):
 
     return beta, r_squared, results, aligned_data
 
+
+def _statement_series(statement, names, default=np.nan):
+    """Return the first available statement line item under common Yahoo labels."""
+    for name in names:
+        if name in statement.columns:
+            return pd.to_numeric(statement[name], errors="coerce")
+    return pd.Series(default, index=statement.index, dtype="float64")
+
+
 def get_historical_data(ticker_symbol):
     """Fetch and process historical financial data for a company."""
     ticker = yf.Ticker(ticker_symbol)
@@ -201,7 +210,19 @@ def get_historical_data(ticker_symbol):
     balance_sheet = ticker.balance_sheet.T.sort_index()
     cash_flows = ticker.cashflow.T.sort_index()
 
-    # Calculate margins and growth rates from income statement
+    # Normalize statement labels because Yahoo omits some lines for industries
+    # such as biotech and uses alternate names for depreciation.
+    income_statement['Total Revenue'] = _statement_series(
+        income_statement, ['Total Revenue', 'Operating Revenue']
+    )
+    income_statement['EBIT'] = _statement_series(
+        income_statement, ['EBIT', 'Operating Income']
+    )
+    gross_profit = _statement_series(income_statement, ['Gross Profit'])
+    if gross_profit.isna().all():
+        cost_of_revenue = _statement_series(income_statement, ['Cost Of Revenue'])
+        gross_profit = income_statement['Total Revenue'] - cost_of_revenue
+    income_statement['Gross Profit'] = gross_profit
     income_statement['Gross Margin'] = income_statement['Gross Profit'] / income_statement['Total Revenue']
     income_statement['EBIT Margin'] = income_statement['EBIT'] / income_statement['Total Revenue']
     income_statement['Revenue Growth'] = income_statement['Total Revenue'].pct_change()
@@ -209,25 +230,40 @@ def get_historical_data(ticker_symbol):
 
     # Get effective tax rate
     if 'Tax Rate For Calcs' in income_statement.columns:
-        eff_tax_rate = income_statement['Tax Rate For Calcs']
+        eff_tax_rate = pd.to_numeric(income_statement['Tax Rate For Calcs'], errors='coerce')
     else:
         # Calculate from tax provision and pretax income if available
         if 'Tax Provision' in income_statement.columns and 'Pretax Income' in income_statement.columns:
-            eff_tax_rate = income_statement['Tax Provision'] / income_statement['Pretax Income']
+            eff_tax_rate = (
+                pd.to_numeric(income_statement['Tax Provision'], errors='coerce')
+                / pd.to_numeric(income_statement['Pretax Income'], errors='coerce')
+            )
         else:
             eff_tax_rate = pd.Series([0.21] * len(income_statement), index=income_statement.index)
+    eff_tax_rate = eff_tax_rate.replace([np.inf, -np.inf], np.nan).fillna(0.21)
 
     # Calculate NWC from balance sheet
     cash_col = 'Cash Cash Equivalents And Short Term Investments' if 'Cash Cash Equivalents And Short Term Investments' in balance_sheet.columns else 'Cash And Cash Equivalents'
     debt_col = 'Current Debt And Capital Lease Obligation' if 'Current Debt And Capital Lease Obligation' in balance_sheet.columns else 'Current Debt'
 
-    balance_sheet["Adj CA"] = balance_sheet["Current Assets"] - balance_sheet.get(cash_col, 0)
-    balance_sheet["Adj CL"] = balance_sheet["Current Liabilities"] - balance_sheet.get(debt_col, 0)
+    current_assets = _statement_series(balance_sheet, ['Current Assets'], default=0)
+    current_liabilities = _statement_series(balance_sheet, ['Current Liabilities'], default=0)
+    cash = _statement_series(balance_sheet, [cash_col], default=0)
+    current_debt = _statement_series(balance_sheet, [debt_col], default=0)
+    balance_sheet["Adj CA"] = current_assets - cash
+    balance_sheet["Adj CL"] = current_liabilities - current_debt
     balance_sheet["NWC"] = balance_sheet["Adj CA"] - balance_sheet["Adj CL"]
     balance_sheet["Ch in NWC"] = balance_sheet["NWC"].diff()
 
     # Process cash flows
-    cash_flows['Capital Expenditure'] = -cash_flows['Capital Expenditure']
+    cash_flows['Capital Expenditure'] = -_statement_series(
+        cash_flows, ['Capital Expenditure'], default=0
+    )
+    cash_flows['Depreciation And Amortization'] = _statement_series(
+        cash_flows,
+        ['Depreciation And Amortization', 'Depreciation Amortization Depletion', 'Depreciation'],
+        default=0,
+    )
 
     # Merge for reinvestment calculation
     merged_cf = cash_flows.join(balance_sheet[["NWC", "Ch in NWC"]])
@@ -260,7 +296,8 @@ def get_ltm_revenue(ticker_symbol):
     ticker = yf.Ticker(ticker_symbol)
     quarterly_data = ticker.quarterly_financials.T.sort_index()
     ltm_data = quarterly_data.iloc[-4:]
-    ltm_revenue = ltm_data['Total Revenue'].sum()
+    revenue_column = 'Total Revenue' if 'Total Revenue' in ltm_data.columns else 'Operating Revenue'
+    ltm_revenue = ltm_data[revenue_column].sum()
     most_recent_date = ltm_data.index[-1]
     return ltm_revenue, most_recent_date
 
