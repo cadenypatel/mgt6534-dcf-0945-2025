@@ -515,13 +515,13 @@ def get_historical_data(ticker_symbol):
         income_statement,
         ['Total Revenue', 'Operating Revenue'],
     ).dropna().sort_index()
-    revenue_growth = revenue_for_window.pct_change()
+    revenue_growth = revenue_for_window.pct_change().replace([np.inf, -np.inf], np.nan)
     revenue_growth_change = revenue_growth.diff()
     ebit_for_growth = _statement_series(
         income_statement,
         ['EBIT', 'Operating Income'],
     ).dropna().sort_index()
-    ebit_growth = ebit_for_growth.pct_change()
+    ebit_growth = ebit_for_growth.pct_change().replace([np.inf, -np.inf], np.nan)
     target_years = set(range(2021, 2026))
     historical_periods = revenue_for_window.index[
         revenue_for_window.index.year.isin(target_years)
@@ -550,11 +550,15 @@ def get_historical_data(ticker_symbol):
         cost_of_revenue = _statement_series(income_statement, ['Cost Of Revenue'])
         gross_profit = income_statement['Total Revenue'] - cost_of_revenue
     income_statement['Gross Profit'] = gross_profit
-    income_statement['Gross Margin'] = income_statement['Gross Profit'] / income_statement['Total Revenue']
-    income_statement['EBIT Margin'] = income_statement['EBIT'] / income_statement['Total Revenue']
-    income_statement['Revenue Growth'] = revenue_growth.reindex(income_statement.index)
-    income_statement['Revenue Growth Change'] = revenue_growth_change.reindex(income_statement.index)
-    income_statement['EBIT Growth'] = ebit_growth.reindex(income_statement.index)
+    income_statement['Gross Margin'] = (
+        income_statement['Gross Profit'] / income_statement['Total Revenue']
+    ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    income_statement['EBIT Margin'] = (
+        income_statement['EBIT'] / income_statement['Total Revenue']
+    ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    income_statement['Revenue Growth'] = revenue_growth.reindex(income_statement.index).fillna(0.0)
+    income_statement['Revenue Growth Change'] = revenue_growth_change.reindex(income_statement.index).fillna(0.0)
+    income_statement['EBIT Growth'] = ebit_growth.reindex(income_statement.index).fillna(0.0)
 
     # Get effective tax rate
     if 'Tax Rate For Calcs' in income_statement.columns:
@@ -610,7 +614,9 @@ def get_historical_data(ticker_symbol):
     df_stats['Eff Tax Rate'] = eff_tax_rate
     df_stats['NOPAT'] = income_statement['NOPAT']
     df_stats['Reinvestment'] = merged_cf['Reinvestment']
-    df_stats['Reinv Rate'] = merged_cf['Reinvestment'] / income_statement['NOPAT']
+    df_stats['Reinv Rate'] = (
+        merged_cf['Reinvestment'] / income_statement['NOPAT']
+    ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     # Sustainable growth is driven by reinvestment and the return earned on
     # the capital supporting the business.
@@ -690,6 +696,21 @@ def get_projection_defaults_from_data(historical_data):
     if revenue_series is not None:
         defaults['Revenue Growth'] = _average_annual_growth(revenue_series)
 
+    ebit_series = income_statement.get('EBIT') if isinstance(income_statement, pd.DataFrame) else None
+    no_positive_operations = (
+        revenue_series is not None
+        and revenue_series.fillna(0).sum() <= 0
+    ) or (
+        ebit_series is not None
+        and ebit_series.dropna().size > 0
+        and ebit_series.dropna().max() <= 0
+    )
+    if no_positive_operations:
+        defaults['Revenue Growth'] = 0.0
+        defaults['EBIT Margin'] = 0.0
+        defaults['Reinv Rate'] = 0.0
+        return defaults
+
     average_return_on_capital = stats['Return on Capital'].dropna().mean()
     if revenue_series is not None and np.isfinite(average_return_on_capital) and average_return_on_capital > 0:
         defaults['Reinv Rate'] = _normalized_reinvestment_rate(
@@ -755,7 +776,9 @@ def get_ltm_revenue(ticker_symbol):
 
     revenue_column = None
     for possible_column in ("Total Revenue", "Operating Revenue", "Revenue"):
-        if possible_column in quarterly_data.columns:
+        if possible_column in quarterly_data.columns and pd.to_numeric(
+            quarterly_data[possible_column], errors="coerce"
+        ).notna().any():
             revenue_column = possible_column
             break
 
@@ -780,7 +803,7 @@ def get_ltm_revenue(ticker_symbol):
     ltm_revenue = float(revenue.sum())
     most_recent_date = revenue.index[-1]
 
-    if not np.isfinite(ltm_revenue) or ltm_revenue <= 0:
+    if not np.isfinite(ltm_revenue) or ltm_revenue < 0:
         raise ValueError(f"Invalid LTM revenue returned for {ticker_symbol}.")
 
     return ltm_revenue, most_recent_date
