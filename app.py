@@ -1,6 +1,9 @@
+import os
+
 import streamlit as st
 import pandas as pd
 import numpy as np
+import requests
 import yfinance as yf
 import statsmodels.api as sm
 
@@ -133,6 +136,22 @@ def _average_annual_growth(series):
 
     positive_growth = yoy_growth[yoy_growth > 0]
     return float(positive_growth.iloc[-1]) if not positive_growth.empty else 0.0
+
+
+def _normalized_reinvestment_rate(stats, revenue_series, fallback):
+    """Return a bounded reinvestment rate using growth, ROC, and positive history."""
+    average_return_on_capital = stats['Return on Capital'].dropna().mean()
+    average_revenue_growth = _average_annual_growth(revenue_series)
+    if np.isfinite(average_return_on_capital) and average_return_on_capital > 0:
+        normalized_rate = average_revenue_growth / average_return_on_capital
+        if 0 <= normalized_rate <= 1:
+            return float(normalized_rate)
+
+    historical_rates = stats['Reinv Rate'].dropna()
+    positive_rates = historical_rates[historical_rates > 0]
+    if not positive_rates.empty:
+        return float(np.clip(positive_rates.mean(), 0.0, 1.0))
+    return float(np.clip(fallback, 0.0, 1.0))
 
 
 def get_company_market_data(ticker_symbol):
@@ -300,18 +319,196 @@ def _statement_series(statement, names, default=np.nan):
     """Return the first available statement line item under common Yahoo labels."""
     for name in names:
         if name in statement.columns:
-            return pd.to_numeric(statement[name], errors="coerce")
+            values = pd.to_numeric(statement[name], errors="coerce")
+            if values.notna().any():
+                return values
     return pd.Series(default, index=statement.index, dtype="float64")
 
 
-def get_historical_data(ticker_symbol):
-    """Fetch and process historical financial data for a company."""
-    ticker = yf.Ticker(ticker_symbol)
+SEC_HEADERS = {
+    "User-Agent": os.getenv(
+        "SEC_USER_AGENT",
+        "PATEL DCF research app (contact: caden.y.patel@gmail.com)",
+    )
+}
 
-    # Get financial statements
-    income_statement = ticker.financials.T.sort_index()
-    balance_sheet = ticker.balance_sheet.T.sort_index()
-    cash_flows = ticker.cashflow.T.sort_index()
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _fetch_sec_json(url):
+    """Fetch and cache one SEC JSON response."""
+    response = requests.get(url, headers=SEC_HEADERS, timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+
+def _get_sec_cik(ticker_symbol):
+    """Resolve a ticker to its SEC zero-padded CIK."""
+    ticker_data = _fetch_sec_json("https://www.sec.gov/files/company_tickers.json")
+    ticker = ticker_symbol.strip().upper()
+    for company in ticker_data.values():
+        if company.get("ticker", "").upper() == ticker:
+            return str(company["cik_str"]).zfill(10)
+    raise ValueError(f"SEC did not return a CIK for ticker {ticker_symbol}.")
+
+
+def _sec_fact_series(facts, tags):
+    """Return the latest annual SEC fact for each fiscal year-end, merging tags."""
+    us_gaap = facts.get("facts", {}).get("us-gaap", {})
+    combined = pd.Series(dtype="float64")
+
+    for tag in tags:
+        fact = us_gaap.get(tag)
+        if not fact:
+            continue
+
+        entries = []
+        for unit_entries in fact.get("units", {}).values():
+            for entry in unit_entries:
+                if entry.get("form") not in ("10-K", "10-K/A") or entry.get("fp") != "FY":
+                    continue
+                if not entry.get("end") or "val" not in entry:
+                    continue
+                if entry.get("start"):
+                    start = pd.to_datetime(entry["start"], errors="coerce")
+                    end = pd.to_datetime(entry["end"], errors="coerce")
+                    if pd.isna(start) or pd.isna(end) or (end - start).days < 300:
+                        continue
+                entries.append(entry)
+
+        if not entries:
+            continue
+
+        fact_frame = pd.DataFrame(entries)
+        fact_frame["filed"] = pd.to_datetime(fact_frame["filed"], errors="coerce")
+        fact_frame["end"] = pd.to_datetime(fact_frame["end"], errors="coerce")
+        fact_frame = fact_frame.dropna(subset=["end", "filed"])
+        fact_frame = fact_frame.sort_values("filed").drop_duplicates("end", keep="last")
+        current = pd.Series(
+            pd.to_numeric(fact_frame["val"], errors="coerce").to_numpy(),
+            index=fact_frame["end"].dt.normalize(),
+            dtype="float64",
+        ).sort_index()
+        combined = combined.combine_first(current)
+
+    return combined.sort_index()
+
+
+def get_sec_historical_statements(ticker_symbol):
+    """Build annual income, balance-sheet, and cash-flow statements from SEC XBRL."""
+    cik = _get_sec_cik(ticker_symbol)
+    facts = _fetch_sec_json(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
+
+    revenue = _sec_fact_series(
+        facts,
+        [
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "RevenueFromContractWithCustomerIncludingAssessedTax",
+            "RegulatedAndUnregulatedOperatingRevenue",
+            "SalesRevenueNet",
+            "Revenues",
+        ],
+    )
+    operating_income = _sec_fact_series(facts, ["OperatingIncomeLoss"])
+    gross_profit = _sec_fact_series(facts, ["GrossProfit"])
+    tax_provision = _sec_fact_series(facts, ["IncomeTaxExpenseBenefit"])
+    pretax_income = _sec_fact_series(
+        facts,
+        [
+            "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+            "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLoss",
+        ],
+    )
+
+    current_assets = _sec_fact_series(facts, ["AssetsCurrent"])
+    current_liabilities = _sec_fact_series(facts, ["LiabilitiesCurrent"])
+    cash = _sec_fact_series(facts, ["CashAndCashEquivalentsAtCarryingValue"])
+    current_debt = _sec_fact_series(
+        facts,
+        ["ShortTermBorrowings", "LongTermDebtCurrent", "LongTermDebtAndFinanceLeaseObligationsCurrent"],
+    )
+    long_term_debt = _sec_fact_series(
+        facts,
+        ["LongTermDebtNoncurrent", "LongTermDebtAndFinanceLeaseObligationsNoncurrent"],
+    )
+    equity = _sec_fact_series(
+        facts,
+        ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
+    )
+    capital_expenditure = _sec_fact_series(
+        facts,
+        ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets"],
+    )
+    depreciation = _sec_fact_series(
+        facts,
+        [
+            "DepreciationDepletionAndAmortization",
+            "DepreciationDepletionAndAmortizationPropertyPlantEquipment",
+            "DepreciationAndAmortization",
+        ],
+    )
+
+    income_index = revenue.index.union(operating_income.index).sort_values()
+    balance_index = current_assets.index.union(current_liabilities.index).sort_values()
+    cash_flow_index = capital_expenditure.index.union(depreciation.index).sort_values()
+
+    income_statement = pd.DataFrame(index=income_index)
+    income_statement["Total Revenue"] = revenue.reindex(income_index)
+    income_statement["EBIT"] = operating_income.reindex(income_index)
+    income_statement["Gross Profit"] = gross_profit.reindex(income_index)
+    income_statement["Tax Provision"] = tax_provision.reindex(income_index)
+    income_statement["Pretax Income"] = pretax_income.reindex(income_index)
+
+    balance_sheet = pd.DataFrame(index=balance_index)
+    balance_sheet["Current Assets"] = current_assets.reindex(balance_index)
+    balance_sheet["Current Liabilities"] = current_liabilities.reindex(balance_index)
+    balance_sheet["Cash And Cash Equivalents"] = cash.reindex(balance_index)
+    balance_sheet["Current Debt"] = current_debt.reindex(balance_index).fillna(0)
+    balance_sheet["Long Term Debt And Capital Lease Obligation"] = long_term_debt.reindex(balance_index).fillna(0)
+    balance_sheet["Total Debt"] = (
+        balance_sheet["Current Debt"] + balance_sheet["Long Term Debt And Capital Lease Obligation"]
+    )
+    balance_sheet["Stockholders Equity"] = equity.reindex(balance_index)
+
+    cash_flows = pd.DataFrame(index=cash_flow_index)
+    cash_flows["Capital Expenditure"] = -capital_expenditure.abs().reindex(cash_flow_index)
+    cash_flows["Depreciation And Amortization"] = depreciation.abs().reindex(cash_flow_index)
+
+    if income_statement["Total Revenue"].dropna().shape[0] < 2:
+        raise ValueError(f"SEC returned insufficient annual revenue history for {ticker_symbol}.")
+    return income_statement, balance_sheet, cash_flows
+
+
+def get_historical_data(ticker_symbol):
+    """Fetch and process historical financial data, preferring SEC annual filings."""
+    try:
+        income_statement, balance_sheet, cash_flows = get_sec_historical_statements(ticker_symbol)
+    except Exception:
+        ticker = yf.Ticker(ticker_symbol)
+        income_statement = ticker.financials.T.sort_index()
+        balance_sheet = ticker.balance_sheet.T.sort_index()
+        cash_flows = ticker.cashflow.T.sort_index()
+
+    cash_flow_fields = {
+        "Capital Expenditure": ["Capital Expenditure"],
+        "Depreciation And Amortization": [
+            "Depreciation And Amortization",
+            "Depreciation Amortization Depletion",
+            "Depreciation",
+        ],
+    }
+    missing_cash_flow_data = any(
+        field not in cash_flows.columns or cash_flows[field].tail(4).notna().sum() < 2
+        for field in cash_flow_fields
+    )
+    if missing_cash_flow_data:
+        try:
+            yahoo_cash_flows = yf.Ticker(ticker_symbol).cashflow.T.sort_index()
+            for field, names in cash_flow_fields.items():
+                yahoo_values = _statement_series(yahoo_cash_flows, names)
+                existing_values = _statement_series(cash_flows, [field])
+                cash_flows[field] = existing_values.combine_first(yahoo_values)
+        except Exception:
+            pass
 
     # Normalize statement labels because Yahoo omits some lines for industries
     # such as biotech and uses alternate names for depreciation.
@@ -428,12 +625,8 @@ def calculate_terminal_growth_rate(historical_data, wacc):
     revenue_series = income_statement.get('Total Revenue') if isinstance(income_statement, pd.DataFrame) else None
 
     if revenue_series is not None and np.isfinite(average_return_on_capital) and average_return_on_capital > 0:
+        average_reinvestment = _normalized_reinvestment_rate(stats, revenue_series, 0.25)
         average_revenue_growth = _average_annual_growth(revenue_series)
-        average_reinvestment = np.clip(
-            average_revenue_growth / average_return_on_capital,
-            0.0,
-            1.0,
-        )
         raw_growth = average_reinvestment * average_return_on_capital
         method = 'Normalized revenue growth ÷ average return on capital'
     else:
@@ -470,9 +663,12 @@ def get_projection_defaults_from_data(historical_data):
         defaults['Revenue Growth'] = _average_annual_growth(revenue_series)
 
     average_return_on_capital = stats['Return on Capital'].dropna().mean()
-    if np.isfinite(average_return_on_capital) and average_return_on_capital > 0:
-        normalized_reinvestment = defaults['Revenue Growth'] / average_return_on_capital
-        defaults['Reinv Rate'] = float(np.clip(normalized_reinvestment, 0.0, 1.0))
+    if revenue_series is not None and np.isfinite(average_return_on_capital) and average_return_on_capital > 0:
+        defaults['Reinv Rate'] = _normalized_reinvestment_rate(
+            stats,
+            revenue_series,
+            defaults['Reinv Rate'],
+        )
     else:
         defaults['Reinv Rate'] = max(defaults['Reinv Rate'], 0.0)
 
