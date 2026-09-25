@@ -302,6 +302,11 @@ def calculate_beta(ticker_symbol, index_symbol="^GSPC"):
     return beta, r_squared, results, aligned_data
 
 
+def adjust_beta_for_wacc(raw_beta):
+    """Apply the standard Blume adjustment to a regression beta."""
+    return (2 / 3) * float(raw_beta) + (1 / 3)
+
+
 def _statement_series(statement, names, default=np.nan):
     """Return the first available statement line item under common Yahoo labels."""
     for name in names:
@@ -758,6 +763,34 @@ def get_projection_defaults(ticker_symbol):
         }
 
 
+def get_projection_assumption_ladders(historical_data, wacc, horizon=10):
+    """Build fading DCF assumptions that converge on terminal economics."""
+    defaults = get_projection_defaults_from_data(historical_data)
+    stats = historical_data['df_stats'].replace([np.inf, -np.inf], np.nan)
+    average_return_on_capital = stats['Return on Capital'].dropna().mean()
+    terminal_growth, _, _, _ = calculate_terminal_growth_rate(historical_data, wacc)
+
+    if np.isfinite(average_return_on_capital) and average_return_on_capital > 0:
+        starting_reinvestment = defaults['Revenue Growth'] / average_return_on_capital
+        terminal_reinvestment = terminal_growth / average_return_on_capital
+    else:
+        starting_reinvestment = defaults['Reinv Rate']
+        terminal_reinvestment = defaults['Reinv Rate']
+
+    margin_values = stats['EBIT Margin'].dropna()
+    terminal_margin = float(margin_values.median()) if not margin_values.empty else defaults['EBIT Margin']
+
+    return {
+        'Revenue Growth': np.linspace(defaults['Revenue Growth'], terminal_growth, horizon).tolist(),
+        'EBIT Margin': np.linspace(defaults['EBIT Margin'], terminal_margin, horizon).tolist(),
+        'Reinv Rate': np.linspace(
+            np.clip(starting_reinvestment, 0.0, 1.0),
+            np.clip(terminal_reinvestment, 0.0, 1.0),
+            horizon,
+        ).tolist(),
+    }
+
+
 def expand_projection_input(raw_value, label, horizon=None):
     """Expand one input to a fixed horizon or return comma-separated yearly values."""
     try:
@@ -1024,7 +1057,8 @@ def render_wacc():
                 w_D = total_debt / (market_cap + total_debt)
 
                 # Calculate beta
-                beta, r_squared, reg_results, return_data = calculate_beta(ticker_symbol)
+                raw_beta, r_squared, reg_results, return_data = calculate_beta(ticker_symbol)
+                beta = adjust_beta_for_wacc(raw_beta)
 
                 # Calculate cost of equity (CAPM)
                 cost_of_equity = risk_free_rate + beta * emrp
@@ -1050,7 +1084,8 @@ def render_wacc():
 
                 with col2:
                     st.markdown("**Beta Estimation**")
-                    st.metric("Beta (β)", f"{beta:.3f}")
+                    st.metric("Adjusted Beta (β)", f"{beta:.3f}")
+                    st.caption(f"Raw regression beta: {raw_beta:.3f}; Blume-adjusted toward 1.0")
                     st.metric("R-squared", f"{r_squared:.3f}")
                     st.caption("Based on 5-year monthly returns vs S&P 500")
 
@@ -1292,14 +1327,30 @@ def render_dcf():
             saved_historical_ticker = st.session_state.get("historical_analysis_ticker")
             if saved_historical_ticker == ticker_symbol and saved_historical_data is not None:
                 projection_defaults = get_projection_defaults_from_data(saved_historical_data)
+                assumption_ladders = get_projection_assumption_ladders(
+                    saved_historical_data,
+                    st.session_state["dcf_wacc_rate"] / 100,
+                )
             else:
                 projection_defaults = get_projection_defaults(ticker_symbol)
+                try:
+                    assumption_ladders = get_projection_assumption_ladders(
+                        get_historical_data(ticker_symbol),
+                        st.session_state["dcf_wacc_rate"] / 100,
+                    )
+                except Exception:
+                    assumption_ladders = None
             for key, column in (
                 ("dcf_growth_input", "Revenue Growth"),
                 ("dcf_margin_input", "EBIT Margin"),
                 ("dcf_reinvestment_input", "Reinv Rate"),
             ):
-                default_value = f"{projection_defaults[column] * 100:.2f}"
+                if assumption_ladders is not None:
+                    default_value = ", ".join(
+                        f"{value * 100:.2f}" for value in assumption_ladders[column]
+                    )
+                else:
+                    default_value = f"{projection_defaults[column] * 100:.2f}"
                 st.session_state[key] = default_value
 
             if st.session_state.get("wacc_calculated_ticker") == ticker_symbol:
