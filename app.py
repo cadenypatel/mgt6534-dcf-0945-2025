@@ -138,20 +138,12 @@ def _average_annual_growth(series):
     return float(positive_growth.iloc[-1]) if not positive_growth.empty else 0.0
 
 
-def _normalized_reinvestment_rate(stats, revenue_series, fallback):
-    """Return a bounded reinvestment rate using growth, ROC, and positive history."""
-    average_return_on_capital = stats['Return on Capital'].dropna().mean()
-    average_revenue_growth = _average_annual_growth(revenue_series)
-    if np.isfinite(average_return_on_capital) and average_return_on_capital > 0:
-        normalized_rate = average_revenue_growth / average_return_on_capital
-        if 0 <= normalized_rate <= 1:
-            return float(normalized_rate)
-
-    historical_rates = stats['Reinv Rate'].dropna()
-    positive_rates = historical_rates[historical_rates > 0]
-    if not positive_rates.empty:
-        return float(np.clip(positive_rates.mean(), 0.0, 1.0))
-    return float(np.clip(fallback, 0.0, 1.0))
+def _average_historical_reinvestment_rate(stats, fallback=0.25):
+    """Return the same historical average shown in the analysis tab."""
+    historical_rates = pd.to_numeric(stats['Reinv Rate'], errors='coerce').dropna()
+    if not historical_rates.empty:
+        return float(historical_rates.mean())
+    return float(fallback)
 
 
 def get_company_market_data(ticker_symbol):
@@ -700,13 +692,11 @@ def calculate_terminal_growth_rate(historical_data, wacc):
     income_statement = historical_data.get('income_statement', pd.DataFrame())
     revenue_series = income_statement.get('Total Revenue') if isinstance(income_statement, pd.DataFrame) else None
 
-    if revenue_series is not None and np.isfinite(average_return_on_capital) and average_return_on_capital > 0:
-        average_reinvestment = _normalized_reinvestment_rate(stats, revenue_series, 0.25)
-        average_revenue_growth = _average_annual_growth(revenue_series)
+    average_reinvestment = _average_historical_reinvestment_rate(stats)
+    if np.isfinite(average_return_on_capital) and average_return_on_capital > 0:
         raw_growth = average_reinvestment * average_return_on_capital
-        method = 'Normalized revenue growth ÷ average return on capital'
+        method = 'Average historical reinvestment rate × average return on capital'
     else:
-        average_reinvestment = stats['Reinv Rate'].dropna().mean()
         raw_growth = stats['Revenue Growth'].dropna().mean()
         method = 'Average historical revenue growth (fallback)'
 
@@ -753,15 +743,10 @@ def get_projection_defaults_from_data(historical_data):
         defaults['Reinv Rate'] = 0.0
         return defaults
 
-    average_return_on_capital = stats['Return on Capital'].dropna().mean()
-    if revenue_series is not None and np.isfinite(average_return_on_capital) and average_return_on_capital > 0:
-        defaults['Reinv Rate'] = _normalized_reinvestment_rate(
-            stats,
-            revenue_series,
-            defaults['Reinv Rate'],
-        )
-    else:
-        defaults['Reinv Rate'] = max(defaults['Reinv Rate'], 0.0)
+    defaults['Reinv Rate'] = _average_historical_reinvestment_rate(
+        stats,
+        defaults['Reinv Rate'],
+    )
 
     return defaults
 
