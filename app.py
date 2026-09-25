@@ -121,7 +121,7 @@ def _latest_statement_value(statement, names):
 
 
 def _average_annual_growth(series):
-    """Compute average YoY revenue growth, preferring positive growth if needed."""
+    """Compute the arithmetic average of valid year-over-year growth rates."""
     values = pd.to_numeric(series, errors="coerce").dropna()
     if values.empty or len(values) < 2:
         return 0.0
@@ -130,12 +130,7 @@ def _average_annual_growth(series):
     if yoy_growth.empty:
         return 0.0
 
-    average_growth = yoy_growth.mean()
-    if average_growth >= 0:
-        return float(average_growth)
-
-    positive_growth = yoy_growth[yoy_growth > 0]
-    return float(positive_growth.iloc[-1]) if not positive_growth.empty else 0.0
+    return float(yoy_growth.mean())
 
 
 def _average_historical_reinvestment_rate(stats, fallback=0.25):
@@ -580,10 +575,10 @@ def get_historical_data(ticker_symbol):
     income_statement['Gross Profit'] = gross_profit
     income_statement['Gross Margin'] = (
         income_statement['Gross Profit'] / income_statement['Total Revenue']
-    ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    ).replace([np.inf, -np.inf], np.nan)
     income_statement['EBIT Margin'] = (
         income_statement['EBIT'] / income_statement['Total Revenue']
-    ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    ).replace([np.inf, -np.inf], np.nan)
     income_statement['Revenue Growth'] = revenue_growth.reindex(income_statement.index).fillna(0.0)
     income_statement['Revenue Growth Change'] = revenue_growth_change.reindex(income_statement.index).fillna(0.0)
     income_statement['EBIT Growth'] = ebit_growth.reindex(income_statement.index).fillna(0.0)
@@ -650,7 +645,7 @@ def get_historical_data(ticker_symbol):
     df_stats['Reinvestment'] = merged_cf['Reinvestment']
     df_stats['Reinv Rate'] = (
         merged_cf['Reinvestment'] / income_statement['NOPAT']
-    ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    ).replace([np.inf, -np.inf], np.nan)
 
     # Sustainable growth is driven by reinvestment and the return earned on
     # the capital supporting the business.
