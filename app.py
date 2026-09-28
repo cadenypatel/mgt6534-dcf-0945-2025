@@ -1122,6 +1122,7 @@ def render_wacc():
                     historical_data = get_historical_data(ticker_symbol)
                     st.session_state["historical_analysis_data"] = historical_data
                     st.session_state["historical_analysis_ticker"] = ticker_symbol
+                    st.session_state["dcf_projection_refresh_needed"] = True
                     terminal_growth, average_reinvestment, average_return_on_capital, growth_method = calculate_terminal_growth_rate(
                         historical_data, wacc
                     )
@@ -1197,6 +1198,7 @@ def render_historical():
                     st.session_state["historical_analysis_data"] = data
                     st.session_state["historical_analysis_ticker"] = ticker_symbol
                     st.session_state["historical_analysis_company"] = company_name
+                    st.session_state["dcf_projection_refresh_needed"] = True
                 else:
                     data = saved_data
                     company_name = st.session_state.get("historical_analysis_company", ticker_symbol)
@@ -1322,7 +1324,10 @@ def render_dcf():
 
     col1, col2, col3 = st.columns(3)
 
-    if st.session_state.get("dcf_tax_ticker") != ticker_symbol:
+    if (
+        st.session_state.get("dcf_tax_ticker") != ticker_symbol
+        or st.session_state.get("dcf_projection_refresh_needed", False)
+    ):
         with st.spinner(f"Loading tax rate for {ticker_symbol}..."):
             st.session_state["dcf_effective_tax_rate"] = get_effective_tax_rate(ticker_symbol) * 100
             saved_historical_data = st.session_state.get("historical_analysis_data")
@@ -1360,6 +1365,7 @@ def render_dcf():
             if st.session_state.get("wacc_terminal_growth_ticker") == ticker_symbol:
                 st.session_state["dcf_terminal_growth_rate"] = st.session_state["wacc_terminal_growth_rate"] * 100
         st.session_state["dcf_tax_ticker"] = ticker_symbol
+        st.session_state["dcf_projection_refresh_needed"] = False
 
     with col2:
         wacc = st.number_input(
