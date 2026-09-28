@@ -1005,7 +1005,9 @@ def render_wacc():
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        ticker_symbol = st.text_input("Ticker Symbol", value="MSFT").upper()
+        ticker_symbol = st.text_input(
+            "Ticker Symbol", value="MSFT", key="shared_ticker_symbol"
+        ).strip().upper()
 
     if st.session_state.get("wacc_defaults_ticker") != ticker_symbol:
         with st.spinner(f"Loading market assumptions for {ticker_symbol}..."):
@@ -1166,15 +1168,16 @@ def render_historical():
     st.header("Historical Analysis")
     st.markdown("Analyze historical financial performance: growth rates, margins, and reinvestment.")
 
+    ticker_symbol = st.session_state.get("shared_ticker_symbol", "MSFT").strip().upper()
+
     # Inputs
-    col1, col2, col3 = st.columns(3)
+    scale_column, _, _ = st.columns(3)
 
-    with col1:
-        ticker_symbol = st.text_input("Ticker Symbol", value="MSFT", key="hist_ticker").upper()
-
-    with col2:
+    with scale_column:
         scale_options = {"Millions ($M)": 1_000_000, "Billions ($B)": 1_000_000_000}
-        scale_choice = st.selectbox("Display Scale", options=list(scale_options.keys()))
+        scale_choice = st.selectbox(
+            "Display Scale", options=list(scale_options.keys()), index=0
+        )
         scale_factor = scale_options[scale_choice]
         scale_name = "$M" if scale_factor == 1_000_000 else "$B"
 
@@ -1315,10 +1318,9 @@ def render_dcf():
     if "dcf_terminal_growth_rate" not in st.session_state:
         st.session_state["dcf_terminal_growth_rate"] = 3.0
 
-    col1, col2, col3 = st.columns(3)
+    ticker_symbol = st.session_state.get("shared_ticker_symbol", "MSFT").strip().upper()
 
-    with col1:
-        ticker_symbol = st.text_input("Ticker Symbol", value="MSFT", key="dcf_ticker").upper()
+    col1, col2, col3 = st.columns(3)
 
     if st.session_state.get("dcf_tax_ticker") != ticker_symbol:
         with st.spinner(f"Loading tax rate for {ticker_symbol}..."):
