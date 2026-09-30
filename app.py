@@ -60,24 +60,31 @@ def inject_styles():
         unsafe_allow_html=True,
     )
 
-# Credit spreads lookup table (from Damodaran, updated January 2025)
+# Credit spreads lookup table (from Damodaran, updated January 2025).
+# IcMin/IcMax are the matching interest-coverage-ratio bands Damodaran uses to
+# map a firm's EBIT/Interest Expense to a synthetic rating for auto-fill.
 CREDIT_SPREADS = [
-    {"Rating": "Aaa/AAA", "Spread": 0.45},
-    {"Rating": "Aa2/AA", "Spread": 0.60},
-    {"Rating": "A1/A+", "Spread": 0.77},
-    {"Rating": "A2/A", "Spread": 0.85},
-    {"Rating": "A3/A-", "Spread": 0.95},
-    {"Rating": "Baa2/BBB", "Spread": 1.20},
-    {"Rating": "Ba1/BB+", "Spread": 1.55},
-    {"Rating": "Ba2/BB", "Spread": 1.83},
-    {"Rating": "B1/B+", "Spread": 2.61},
-    {"Rating": "B2/B", "Spread": 3.00},
-    {"Rating": "B3/B-", "Spread": 4.42},
-    {"Rating": "Caa/CCC", "Spread": 7.28},
-    {"Rating": "Ca2/CC", "Spread": 10.10},
-    {"Rating": "C2/C", "Spread": 15.50},
-    {"Rating": "D2/D", "Spread": 19.00},
+    {"Rating": "Aaa/AAA", "Spread": 0.45, "IcMin": 8.5, "IcMax": float("inf")},
+    {"Rating": "Aa2/AA", "Spread": 0.60, "IcMin": 6.5, "IcMax": 8.5},
+    {"Rating": "A1/A+", "Spread": 0.77, "IcMin": 5.5, "IcMax": 6.5},
+    {"Rating": "A2/A", "Spread": 0.85, "IcMin": 4.25, "IcMax": 5.5},
+    {"Rating": "A3/A-", "Spread": 0.95, "IcMin": 3.0, "IcMax": 4.25},
+    {"Rating": "Baa2/BBB", "Spread": 1.20, "IcMin": 2.5, "IcMax": 3.0},
+    {"Rating": "Ba1/BB+", "Spread": 1.55, "IcMin": 2.25, "IcMax": 2.5},
+    {"Rating": "Ba2/BB", "Spread": 1.83, "IcMin": 2.0, "IcMax": 2.25},
+    {"Rating": "B1/B+", "Spread": 2.61, "IcMin": 1.75, "IcMax": 2.0},
+    {"Rating": "B2/B", "Spread": 3.00, "IcMin": 1.5, "IcMax": 1.75},
+    {"Rating": "B3/B-", "Spread": 4.42, "IcMin": 1.25, "IcMax": 1.5},
+    {"Rating": "Caa/CCC", "Spread": 7.28, "IcMin": 0.8, "IcMax": 1.25},
+    {"Rating": "Ca2/CC", "Spread": 10.10, "IcMin": 0.65, "IcMax": 0.8},
+    {"Rating": "C2/C", "Spread": 15.50, "IcMin": 0.2, "IcMax": 0.65},
+    {"Rating": "D2/D", "Spread": 19.00, "IcMin": float("-inf"), "IcMax": 0.2},
 ]
+
+# Damodaran's implied equity risk premium for the US market (source:
+# https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/ctryprem.html,
+# updated January 2025). Used as the default EMRP; still editable in the UI.
+DEFAULT_EMRP = 0.0433
 
 # ============================================================================
 # Helper Functions
@@ -89,6 +96,43 @@ def get_credit_spread(rating):
         if entry["Rating"].lower() == rating.lower():
             return entry["Spread"] / 100
     return None
+
+
+def estimate_credit_rating(interest_coverage_ratio):
+    """Map an interest-coverage ratio to a synthetic rating using Damodaran's bands."""
+    if interest_coverage_ratio is None or not np.isfinite(interest_coverage_ratio):
+        return None
+    for entry in CREDIT_SPREADS:
+        if entry["IcMin"] <= interest_coverage_ratio < entry["IcMax"]:
+            return entry["Rating"]
+    return None
+
+
+def get_interest_coverage_ratio(ticker_symbol):
+    """Return the latest annual EBIT / Interest Expense ratio, or None if unavailable."""
+    try:
+        income_stmt = yf.Ticker(ticker_symbol).financials
+        if income_stmt is None or income_stmt.empty:
+            return None
+        latest = income_stmt.sort_index(axis=1, ascending=False).iloc[:, 0]
+
+        ebit = None
+        for label in ("EBIT", "Operating Income"):
+            if label in latest.index and pd.notna(latest[label]):
+                ebit = float(latest[label])
+                break
+
+        interest_expense = None
+        for label in ("Interest Expense", "Interest Expense Non Operating"):
+            if label in latest.index and pd.notna(latest[label]):
+                interest_expense = abs(float(latest[label]))
+                break
+
+        if ebit is None or not interest_expense:
+            return None
+        return ebit / interest_expense
+    except Exception:
+        return None
 
 
 def _positive_number(value):
@@ -243,7 +287,7 @@ def get_company_market_data(ticker_symbol):
 
 
 def get_wacc_input_defaults(ticker_symbol):
-    """Fetch current market assumptions and a ticker-specific tax-rate estimate."""
+    """Fetch current market assumptions and ticker-specific tax-rate/rating estimates."""
     risk_free_rate = 0.045
     try:
         treasury_history = yf.Ticker("^TNX").history(period="5d", auto_adjust=False)["Close"].dropna()
@@ -254,9 +298,19 @@ def get_wacc_input_defaults(ticker_symbol):
     except Exception:
         pass
 
-    # EMRP is a market-wide assumption, not a company-specific input.
-    equity_market_risk_premium = 0.05
-    return risk_free_rate, equity_market_risk_premium, get_effective_tax_rate(ticker_symbol)
+    # EMRP is a market-wide assumption sourced from Damodaran's implied ERP,
+    # not a company-specific input; remains editable in the UI.
+    equity_market_risk_premium = DEFAULT_EMRP
+
+    interest_coverage_ratio = get_interest_coverage_ratio(ticker_symbol)
+    credit_rating_default = estimate_credit_rating(interest_coverage_ratio) or "Baa2/BBB"
+
+    return (
+        risk_free_rate,
+        equity_market_risk_premium,
+        get_effective_tax_rate(ticker_symbol),
+        credit_rating_default,
+    )
 
 
 def get_effective_tax_rate(ticker_symbol):
@@ -983,10 +1037,11 @@ def render_wacc():
 
     if st.session_state.get("wacc_defaults_ticker") != ticker_symbol:
         with st.spinner(f"Loading market assumptions for {ticker_symbol}..."):
-            risk_free_default, emrp_default, tax_default = get_wacc_input_defaults(ticker_symbol)
+            risk_free_default, emrp_default, tax_default, rating_default = get_wacc_input_defaults(ticker_symbol)
         st.session_state["wacc_risk_free_rate"] = risk_free_default * 100
         st.session_state["wacc_emrp"] = emrp_default * 100
         st.session_state["wacc_tax_rate"] = tax_default * 100
+        st.session_state["wacc_credit_rating"] = rating_default
         st.session_state["wacc_defaults_ticker"] = ticker_symbol
 
     with col1:
@@ -1000,10 +1055,13 @@ def render_wacc():
         emrp = st.number_input(
             "Equity Market Risk Premium (%)",
             min_value=0.0, max_value=20.0, step=0.1, key="wacc_emrp",
-            help="Market-wide assumption, auto-populated at 5.0%; adjust if needed"
+            help="Auto-populated from Damodaran's implied ERP for the US market; adjust if needed"
         ) / 100
         rating_options = [entry["Rating"] for entry in CREDIT_SPREADS]
-        firm_rating = st.selectbox("Credit Rating", options=rating_options, index=0)
+        firm_rating = st.selectbox(
+            "Credit Rating", options=rating_options, key="wacc_credit_rating",
+            help="Auto-populated from the ticker's interest coverage ratio (EBIT / Interest Expense)"
+        )
 
     with col3:
         marg_tax_rate = st.number_input(
@@ -1012,7 +1070,7 @@ def render_wacc():
             help="Auto-populated from the ticker's latest usable tax rate"
         ) / 100
 
-    st.caption("Risk-free rate and tax rate refresh when the ticker changes. EMRP is a market-wide assumption and remains editable.")
+    st.caption("Risk-free rate, tax rate, and credit rating refresh when the ticker changes. EMRP is a market-wide assumption sourced from Damodaran and remains editable.")
 
     calculate_button = st.button("Calculate WACC", type="primary")
 

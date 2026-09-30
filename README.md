@@ -83,4 +83,4 @@ MIT License - Free to use for educational purposes
 
 ## Author
 
-Caden Patel - Vanderbilt University
+Caden Patel
