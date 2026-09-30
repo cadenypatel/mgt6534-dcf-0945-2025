@@ -168,8 +168,46 @@ def _latest_statement_value(statement, names):
     return None
 
 
+def _dampen_outlier_weights(values):
+    """Return weights that down-weight statistical outlier years via MAD so a
+    one-off spike/drop (e.g., a divestiture or impairment) doesn't dominate a
+    multi-year average. Outlier years get ~35% of an equal weight (e.g., ~7%
+    instead of 20% for a 5-year window); remaining years are renormalized.
+    Applies the same way regardless of ticker.
+    """
+    n = len(values)
+    weights = np.ones(n)
+    if n > 2:
+        median = values.median()
+        mad = (values - median).abs().median()
+        if mad > 0:
+            modified_z_scores = 0.6745 * (values - median) / mad
+            weights = np.where(modified_z_scores.abs() > 2.0, 0.35, 1.0).astype(float)
+    return weights / weights.sum()
+
+
+def _recency_weighted_average(values, decay=0.65):
+    """Exponentially recency-weighted average (most recent year weighted
+    heaviest). Used for metrics like margins, return on capital, and growth
+    where a company can undergo a genuine structural shift (e.g., margin
+    expansion/contraction) that a flat multi-year average would understate;
+    this is distinct from one-off statistical outliers. Applies the same way
+    regardless of ticker.
+    """
+    values = pd.to_numeric(values, errors="coerce").dropna()
+    n = len(values)
+    if n == 0:
+        return np.nan
+    if n == 1:
+        return float(values.iloc[0])
+
+    weights = np.array([decay ** (n - 1 - i) for i in range(n)])
+    weights = weights / weights.sum()
+    return float(np.average(values.to_numpy(), weights=weights))
+
+
 def _average_annual_growth(series):
-    """Compute the arithmetic average of valid year-over-year growth rates."""
+    """Compute a recency-weighted average of year-over-year growth rates."""
     values = pd.to_numeric(series, errors="coerce").dropna()
     if values.empty or len(values) < 2:
         return 0.0
@@ -178,32 +216,7 @@ def _average_annual_growth(series):
     if yoy_growth.empty:
         return 0.0
 
-    return float(yoy_growth.mean())
-
-
-def _robust_reinvestment_weights(values):
-    """Down-weight statistical outlier years so a one-off spike/drop (e.g., a
-    divestiture or impairment) doesn't dominate the multi-year average.
-
-    Uses the median absolute deviation (MAD) to flag outliers, since it is
-    less sensitive to the very outliers it's trying to detect than a
-    mean/std-based z-score. Outlier years get ~35% of an equal weight
-    (e.g., ~7% instead of 20% for a 5-year window); the remaining years are
-    renormalized so weights still sum to 1.
-    """
-    n = len(values)
-    equal_weights = np.ones(n) / n
-    if n <= 2:
-        return equal_weights
-
-    median = values.median()
-    mad = (values - median).abs().median()
-    if mad == 0:
-        return equal_weights
-
-    modified_z_scores = 0.6745 * (values - median) / mad
-    raw_weights = np.where(modified_z_scores.abs() > 2.0, 0.35, 1.0)
-    return raw_weights / raw_weights.sum()
+    return _recency_weighted_average(yoy_growth)
 
 
 def _average_historical_reinvestment_rate(stats, fallback=0.25):
@@ -211,7 +224,7 @@ def _average_historical_reinvestment_rate(stats, fallback=0.25):
     historical_rates = pd.to_numeric(stats['Reinv Rate'], errors='coerce').dropna()
     if historical_rates.empty:
         return float(fallback)
-    weights = _robust_reinvestment_weights(historical_rates)
+    weights = _dampen_outlier_weights(historical_rates)
     return float(np.average(historical_rates.to_numpy(), weights=weights))
 
 
@@ -773,7 +786,7 @@ def get_historical_data(ticker_symbol):
 def calculate_terminal_growth_rate(historical_data, wacc):
     """Estimate sustainable terminal growth from historical reinvestment and ROC."""
     stats = historical_data['df_stats'].replace([np.inf, -np.inf], np.nan)
-    average_return_on_capital = stats['Return on Capital'].dropna().mean()
+    average_return_on_capital = _recency_weighted_average(stats['Return on Capital'].dropna())
     income_statement = historical_data.get('income_statement', pd.DataFrame())
     revenue_series = income_statement.get('Total Revenue') if isinstance(income_statement, pd.DataFrame) else None
 
@@ -782,7 +795,7 @@ def calculate_terminal_growth_rate(historical_data, wacc):
         raw_growth = average_reinvestment * average_return_on_capital
         method = 'Average historical reinvestment rate × average return on capital'
     else:
-        raw_growth = stats['Revenue Growth'].dropna().mean()
+        raw_growth = _recency_weighted_average(stats['Revenue Growth'].dropna())
         method = 'Average historical revenue growth (fallback)'
 
     if not np.isfinite(raw_growth):
@@ -808,7 +821,7 @@ def get_projection_defaults_from_data(historical_data):
     defaults = {}
     for column, fallback in fallback_values.items():
         values = stats[column].dropna()
-        defaults[column] = float(values.mean()) if not values.empty else fallback
+        defaults[column] = _recency_weighted_average(values) if not values.empty else fallback
     revenue_series = income_statement.get('Total Revenue') if isinstance(income_statement, pd.DataFrame) else None
     if revenue_series is not None:
         defaults['Revenue Growth'] = _average_annual_growth(revenue_series)
@@ -1354,8 +1367,9 @@ def render_historical():
                     st.metric("Avg Revenue Growth", f"{avg_rev_growth:.2%}")
 
                 with avg_col2:
-                    avg_ebit_margin = df_stats['EBIT Margin'].mean()
+                    avg_ebit_margin = _recency_weighted_average(df_stats['EBIT Margin'])
                     st.metric("Avg EBIT Margin", f"{avg_ebit_margin:.2%}")
+                    st.caption("Recent years weighted more to reflect structural margin shifts.")
 
                 with avg_col3:
                     avg_tax_rate = df_stats['Eff Tax Rate'].mean()
