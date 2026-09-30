@@ -238,6 +238,22 @@ def _average_dampening_giant_outliers_only(values, fallback=np.nan):
     return float(np.average(values.to_numpy(), weights=weights))
 
 
+def _average_revenue_growth(values, threshold=0.40, giant_weight=0.15, fallback=np.nan):
+    """Historical average revenue growth: a straight average, except a year
+    whose growth swings beyond a hard +/-40% threshold (e.g., a pandemic-era
+    demand spike/collapse) is down-weighted rather than excluded. Applies the
+    same way regardless of ticker.
+    """
+    values = pd.to_numeric(values, errors="coerce").dropna()
+    if values.empty:
+        return float(fallback) if np.isfinite(fallback) else np.nan
+    if len(values) == 1:
+        return float(values.iloc[0])
+    weights = np.where(np.abs(values.to_numpy()) > threshold, giant_weight, 1.0)
+    weights = weights / weights.sum()
+    return float(np.average(values.to_numpy(), weights=weights))
+
+
 def _dampen_outlier_weights(values):
     """Return normalized weights that down-weight statistical/giant outlier
     years so a one-off spike/drop (e.g., a divestiture or impairment) doesn't
@@ -845,7 +861,7 @@ def calculate_terminal_growth_rate(historical_data, wacc):
         raw_growth = average_reinvestment * average_return_on_capital
         method = 'Average historical reinvestment rate × average return on capital'
     else:
-        raw_growth = _average_dampening_giant_outliers_only(stats['Revenue Growth'].dropna())
+        raw_growth = _average_revenue_growth(stats['Revenue Growth'].dropna())
         method = 'Average historical revenue growth (fallback)'
 
     if not np.isfinite(raw_growth):
@@ -877,8 +893,11 @@ def get_projection_defaults_from_data(historical_data):
             # Overwritten below by _average_historical_reinvestment_rate (MAD +
             # giant-outlier dampening, no recency tilt); placeholder for now.
             defaults[column] = fallback
+        elif column == 'Revenue Growth':
+            # Hard +/-40% threshold, not a ratio-based rule; no recency tilt.
+            defaults[column] = _average_revenue_growth(values)
         else:
-            # Revenue Growth and EBIT Margin: only suppress true giant outliers,
+            # EBIT Margin: only suppress true giant outliers (4x rule),
             # no moderate MAD dampening or recency tilt.
             defaults[column] = _average_dampening_giant_outliers_only(values)
 
@@ -1420,7 +1439,7 @@ def render_historical():
                 avg_col1, avg_col2, avg_col3, avg_col4 = st.columns(4)
 
                 with avg_col1:
-                    avg_rev_growth = _average_dampening_giant_outliers_only(df_stats['Revenue Growth'])
+                    avg_rev_growth = _average_revenue_growth(df_stats['Revenue Growth'])
                     st.metric("Avg Revenue Growth", f"{avg_rev_growth:.2%}")
 
                 with avg_col2:
