@@ -104,7 +104,11 @@ def estimate_credit_rating(interest_coverage_ratio):
         return None
     for entry in CREDIT_SPREADS:
         if entry["IcMin"] <= interest_coverage_ratio < entry["IcMax"]:
-            return entry["Rating"]
+            rating = entry["Rating"]
+            # True Aaa/AAA is exceedingly rare in practice (a handful of issuers
+            # worldwide); interest coverage alone overstates it, so cap the
+            # auto-filled estimate at Aa2/AA and leave Aaa/AAA as a manual override.
+            return "Aa2/AA" if rating == "Aaa/AAA" else rating
     return None
 
 
@@ -177,12 +181,38 @@ def _average_annual_growth(series):
     return float(yoy_growth.mean())
 
 
+def _robust_reinvestment_weights(values):
+    """Down-weight statistical outlier years so a one-off spike/drop (e.g., a
+    divestiture or impairment) doesn't dominate the multi-year average.
+
+    Uses the median absolute deviation (MAD) to flag outliers, since it is
+    less sensitive to the very outliers it's trying to detect than a
+    mean/std-based z-score. Outlier years get ~35% of an equal weight
+    (e.g., ~7% instead of 20% for a 5-year window); the remaining years are
+    renormalized so weights still sum to 1.
+    """
+    n = len(values)
+    equal_weights = np.ones(n) / n
+    if n <= 2:
+        return equal_weights
+
+    median = values.median()
+    mad = (values - median).abs().median()
+    if mad == 0:
+        return equal_weights
+
+    modified_z_scores = 0.6745 * (values - median) / mad
+    raw_weights = np.where(modified_z_scores.abs() > 2.0, 0.35, 1.0)
+    return raw_weights / raw_weights.sum()
+
+
 def _average_historical_reinvestment_rate(stats, fallback=0.25):
-    """Return the same historical average shown in the analysis tab."""
+    """Return an outlier-dampened historical average, shown in the analysis tab."""
     historical_rates = pd.to_numeric(stats['Reinv Rate'], errors='coerce').dropna()
-    if not historical_rates.empty:
-        return float(historical_rates.mean())
-    return float(fallback)
+    if historical_rates.empty:
+        return float(fallback)
+    weights = _robust_reinvestment_weights(historical_rates)
+    return float(np.average(historical_rates.to_numpy(), weights=weights))
 
 
 def get_company_market_data(ticker_symbol):
@@ -310,6 +340,7 @@ def get_wacc_input_defaults(ticker_symbol):
         equity_market_risk_premium,
         get_effective_tax_rate(ticker_symbol),
         credit_rating_default,
+        interest_coverage_ratio,
     )
 
 
@@ -1037,11 +1068,12 @@ def render_wacc():
 
     if st.session_state.get("wacc_defaults_ticker") != ticker_symbol:
         with st.spinner(f"Loading market assumptions for {ticker_symbol}..."):
-            risk_free_default, emrp_default, tax_default, rating_default = get_wacc_input_defaults(ticker_symbol)
+            risk_free_default, emrp_default, tax_default, rating_default, ic_ratio = get_wacc_input_defaults(ticker_symbol)
         st.session_state["wacc_risk_free_rate"] = risk_free_default * 100
         st.session_state["wacc_emrp"] = emrp_default * 100
         st.session_state["wacc_tax_rate"] = tax_default * 100
         st.session_state["wacc_credit_rating"] = rating_default
+        st.session_state["wacc_interest_coverage"] = ic_ratio
         st.session_state["wacc_defaults_ticker"] = ticker_symbol
 
     with col1:
@@ -1060,8 +1092,11 @@ def render_wacc():
         rating_options = [entry["Rating"] for entry in CREDIT_SPREADS]
         firm_rating = st.selectbox(
             "Credit Rating", options=rating_options, key="wacc_credit_rating",
-            help="Auto-populated from the ticker's interest coverage ratio (EBIT / Interest Expense)"
+            help="Estimated from the ticker's interest coverage ratio (EBIT / Interest Expense); this is a modeled synthetic rating, not the company's official agency rating, so override it if you know the actual rating"
         )
+        ic_ratio = st.session_state.get("wacc_interest_coverage")
+        if ic_ratio is not None:
+            st.caption(f"Estimated from interest coverage of {ic_ratio:.1f}x; verify against the company's actual published rating if known.")
 
     with col3:
         marg_tax_rate = st.number_input(
@@ -1327,8 +1362,9 @@ def render_historical():
                     st.metric("Avg Eff Tax Rate", f"{avg_tax_rate:.2%}")
 
                 with avg_col4:
-                    avg_reinv_rate = df_stats['Reinv Rate'].mean()
+                    avg_reinv_rate = _average_historical_reinvestment_rate(df_stats)
                     st.metric("Avg Reinv Rate", f"{avg_reinv_rate:.2%}")
+                    st.caption("Outlier years are down-weighted (not a simple mean).")
 
             except Exception as e:
                 st.error(f"Error: {str(e)}")
