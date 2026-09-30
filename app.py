@@ -212,6 +212,32 @@ def _outlier_weights(values, giant_multiple=4.0, giant_weight=0.15, moderate_wei
     return weights
 
 
+def _giant_outlier_weights(values, giant_multiple=4.0, giant_weight=0.15):
+    """Normalized weights that down-weight only true giant outliers (>=
+    `giant_multiple`x the next-largest same-direction value); every other
+    year keeps equal weight. No moderate MAD check, no recency tilt — used
+    for revenue growth and EBIT margin, where a flat historical average is
+    preferred except for unmistakably extreme, unlikely-to-recur years.
+    """
+    arr = values.to_numpy() if hasattr(values, "to_numpy") else np.asarray(values, dtype=float)
+    n = len(arr)
+    weights = np.where(_flag_giant_outliers(arr, multiple=giant_multiple), giant_weight, 1.0)
+    return weights / weights.sum()
+
+
+def _average_dampening_giant_outliers_only(values, fallback=np.nan):
+    """Historical average that only suppresses true giant outliers (see
+    `_giant_outlier_weights`), leaving all other years equally weighted.
+    """
+    values = pd.to_numeric(values, errors="coerce").dropna()
+    if values.empty:
+        return float(fallback) if np.isfinite(fallback) else np.nan
+    if len(values) == 1:
+        return float(values.iloc[0])
+    weights = _giant_outlier_weights(values)
+    return float(np.average(values.to_numpy(), weights=weights))
+
+
 def _dampen_outlier_weights(values):
     """Return normalized weights that down-weight statistical/giant outlier
     years so a one-off spike/drop (e.g., a divestiture or impairment) doesn't
@@ -819,7 +845,7 @@ def calculate_terminal_growth_rate(historical_data, wacc):
         raw_growth = average_reinvestment * average_return_on_capital
         method = 'Average historical reinvestment rate × average return on capital'
     else:
-        raw_growth = _recency_weighted_average(stats['Revenue Growth'].dropna())
+        raw_growth = _average_dampening_giant_outliers_only(stats['Revenue Growth'].dropna())
         method = 'Average historical revenue growth (fallback)'
 
     if not np.isfinite(raw_growth):
@@ -845,7 +871,16 @@ def get_projection_defaults_from_data(historical_data):
     defaults = {}
     for column, fallback in fallback_values.items():
         values = stats[column].dropna()
-        defaults[column] = _recency_weighted_average(values) if not values.empty else fallback
+        if values.empty:
+            defaults[column] = fallback
+        elif column == 'Reinv Rate':
+            # Overwritten below by _average_historical_reinvestment_rate (MAD +
+            # giant-outlier dampening, no recency tilt); placeholder for now.
+            defaults[column] = fallback
+        else:
+            # Revenue Growth and EBIT Margin: only suppress true giant outliers,
+            # no moderate MAD dampening or recency tilt.
+            defaults[column] = _average_dampening_giant_outliers_only(values)
 
     ebit_series = income_statement.get('EBIT') if isinstance(income_statement, pd.DataFrame) else None
     revenue_series = income_statement.get('Total Revenue') if isinstance(income_statement, pd.DataFrame) else None
@@ -1385,13 +1420,13 @@ def render_historical():
                 avg_col1, avg_col2, avg_col3, avg_col4 = st.columns(4)
 
                 with avg_col1:
-                    avg_rev_growth = _recency_weighted_average(df_stats['Revenue Growth'])
+                    avg_rev_growth = _average_dampening_giant_outliers_only(df_stats['Revenue Growth'])
                     st.metric("Avg Revenue Growth", f"{avg_rev_growth:.2%}")
 
                 with avg_col2:
-                    avg_ebit_margin = _recency_weighted_average(df_stats['EBIT Margin'])
+                    avg_ebit_margin = _average_dampening_giant_outliers_only(df_stats['EBIT Margin'])
                     st.metric("Avg EBIT Margin", f"{avg_ebit_margin:.2%}")
-                    st.caption("Recent years weighted more to reflect structural margin shifts.")
+                    st.caption("Only true giant outliers (4x rule) are down-weighted.")
 
                 with avg_col3:
                     avg_tax_rate = df_stats['Eff Tax Rate'].mean()
