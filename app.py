@@ -253,18 +253,53 @@ def _average_dampening_giant_outliers_only(values, fallback=np.nan):
     return float(np.average(values.to_numpy(), weights=weights))
 
 
-def _average_revenue_growth(values, threshold=0.40, giant_weight=0.15, fallback=np.nan):
+def _flag_extreme_revenue_growth(values, hard_threshold=0.40, ratio_multiple=1.40):
+    """Flag a revenue growth year as a clear outlier only if it clears BOTH:
+    (1) a hard +/-40% threshold, and (2) is at least `ratio_multiple`x the
+    next-largest same-direction value. This avoids penalizing a sustained
+    high-growth (or decline) streak — e.g., 32% growth followed by 44% growth
+    isn't an outlier, since the two years are close to each other — while
+    still catching a genuine one-off spike/collapse. If there's no second
+    same-direction value to compare against, the hard threshold alone applies.
+    """
+    arr = np.asarray(values, dtype=float)
+    is_extreme = np.zeros(len(arr), dtype=bool)
+
+    positives = np.sort(arr[arr > 0])[::-1]
+    if len(positives) >= 1 and positives[0] > hard_threshold:
+        if len(positives) >= 2 and positives[1] > 0:
+            if positives[0] >= ratio_multiple * positives[1]:
+                is_extreme |= np.isclose(arr, positives[0])
+        else:
+            is_extreme |= np.isclose(arr, positives[0])
+
+    negatives = np.sort(arr[arr < 0])
+    if len(negatives) >= 1 and abs(negatives[0]) > hard_threshold:
+        if len(negatives) >= 2 and negatives[1] < 0:
+            if abs(negatives[0]) >= ratio_multiple * abs(negatives[1]):
+                is_extreme |= np.isclose(arr, negatives[0])
+        else:
+            is_extreme |= np.isclose(arr, negatives[0])
+
+    return is_extreme
+
+
+def _average_revenue_growth(values, hard_threshold=0.40, ratio_multiple=1.40, giant_weight=0.15, fallback=np.nan):
     """Historical average revenue growth: a straight average, except a year
-    whose growth swings beyond a hard +/-40% threshold (e.g., a pandemic-era
-    demand spike/collapse) is down-weighted rather than excluded. Applies the
-    same way regardless of ticker.
+    that is both a hard +/-40% outlier and a clear outlier vs. its peers (see
+    `_flag_extreme_revenue_growth`) is down-weighted rather than excluded.
+    Applies the same way regardless of ticker.
     """
     values = pd.to_numeric(values, errors="coerce").dropna()
     if values.empty:
         return float(fallback) if np.isfinite(fallback) else np.nan
     if len(values) == 1:
         return float(values.iloc[0])
-    weights = np.where(np.abs(values.to_numpy()) > threshold, giant_weight, 1.0)
+    weights = np.where(
+        _flag_extreme_revenue_growth(values.to_numpy(), hard_threshold, ratio_multiple),
+        giant_weight,
+        1.0,
+    )
     weights = weights / weights.sum()
     return float(np.average(values.to_numpy(), weights=weights))
 
