@@ -168,6 +168,21 @@ def _latest_statement_value(statement, names):
     return None
 
 
+def _reindex_nearest(series, target_index, tolerance_days=10):
+    """Align a series onto target_index by nearest date within a tolerance.
+
+    Different data sources (e.g., SEC EDGAR vs. Yahoo) can report the same
+    fiscal period with slightly different period-end dates; a plain reindex
+    or combine_first would miss the match entirely and leave the gap unfilled.
+    Applies the same way regardless of ticker.
+    """
+    if series.empty:
+        return pd.Series(np.nan, index=target_index, dtype="float64")
+    return series.sort_index().reindex(
+        target_index, method="nearest", tolerance=pd.Timedelta(days=tolerance_days)
+    )
+
+
 def _flag_giant_outliers(values, multiple=4.0):
     """Flag values at least `multiple`x the size of the next-largest value on
     the same side (upside vs. downside) — i.e., truly extreme, unlikely-to-recur
@@ -577,7 +592,18 @@ def get_sec_historical_statements(ticker_symbol):
 
     current_assets = _sec_fact_series(facts, ["AssetsCurrent"])
     current_liabilities = _sec_fact_series(facts, ["LiabilitiesCurrent"])
-    cash = _sec_fact_series(facts, ["CashAndCashEquivalentsAtCarryingValue"])
+    cash = _sec_fact_series(
+        facts,
+        [
+            "CashAndCashEquivalentsAtCarryingValue",
+            "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+            "CashAndCashEquivalentsAtCarryingValueIncludingDiscontinuedOperations",
+        ],
+    )
+    cost_of_revenue = _sec_fact_series(
+        facts,
+        ["CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsSold", "CostOfServices"],
+    )
     current_debt = _sec_fact_series(
         facts,
         ["ShortTermBorrowings", "LongTermDebtCurrent", "LongTermDebtAndFinanceLeaseObligationsCurrent"],
@@ -612,19 +638,23 @@ def get_sec_historical_statements(ticker_symbol):
     income_statement["Total Revenue"] = revenue.reindex(income_index)
     income_statement["EBIT"] = operating_income.reindex(income_index)
     income_statement["Gross Profit"] = gross_profit.reindex(income_index)
+    income_statement["Cost Of Revenue"] = cost_of_revenue.reindex(income_index)
     income_statement["Tax Provision"] = tax_provision.reindex(income_index)
     income_statement["Pretax Income"] = pretax_income.reindex(income_index)
 
     balance_sheet = pd.DataFrame(index=balance_index)
-    balance_sheet["Current Assets"] = current_assets.reindex(balance_index)
-    balance_sheet["Current Liabilities"] = current_liabilities.reindex(balance_index)
-    balance_sheet["Cash And Cash Equivalents"] = cash.reindex(balance_index)
+    # Forward/back-fill sporadic single-year gaps (e.g., a company switching
+    # XBRL tags between filings) so one missing year doesn't null out the
+    # entire downstream NWC/reinvestment calculation. Applies to every ticker.
+    balance_sheet["Current Assets"] = current_assets.reindex(balance_index).ffill().bfill()
+    balance_sheet["Current Liabilities"] = current_liabilities.reindex(balance_index).ffill().bfill()
+    balance_sheet["Cash And Cash Equivalents"] = cash.reindex(balance_index).ffill().bfill().fillna(0)
     balance_sheet["Current Debt"] = current_debt.reindex(balance_index).fillna(0)
     balance_sheet["Long Term Debt And Capital Lease Obligation"] = long_term_debt.reindex(balance_index).fillna(0)
     balance_sheet["Total Debt"] = (
         balance_sheet["Current Debt"] + balance_sheet["Long Term Debt And Capital Lease Obligation"]
     )
-    balance_sheet["Stockholders Equity"] = equity.reindex(balance_index)
+    balance_sheet["Stockholders Equity"] = equity.reindex(balance_index).ffill().bfill()
 
     cash_flows = pd.DataFrame(index=cash_flow_index)
     cash_flows["Capital Expenditure"] = -capital_expenditure.abs().reindex(cash_flow_index)
@@ -666,9 +696,30 @@ def get_historical_data(ticker_symbol):
         try:
             yahoo_cash_flows = yf.Ticker(ticker_symbol).cashflow.T.sort_index()
             for field, names in cash_flow_fields.items():
-                yahoo_values = _statement_series(yahoo_cash_flows, names)
+                yahoo_values = _reindex_nearest(_statement_series(yahoo_cash_flows, names), cash_flows.index)
                 existing_values = _statement_series(cash_flows, [field])
                 cash_flows[field] = existing_values.combine_first(yahoo_values)
+        except Exception:
+            pass
+
+    # Some companies (e.g., restaurants) never tag GrossProfit/CostOfRevenue in
+    # SEC XBRL since their filings don't present a distinct COGS subtotal;
+    # Yahoo's reclassified statements often fill this gap. Applies to any ticker.
+    income_statement_fields = {
+        "Gross Profit": ["Gross Profit"],
+        "Cost Of Revenue": ["Cost Of Revenue"],
+    }
+    missing_income_data = any(
+        field not in income_statement.columns or income_statement[field].tail(4).notna().sum() < 2
+        for field in income_statement_fields
+    )
+    if missing_income_data:
+        try:
+            yahoo_income_statement = yf.Ticker(ticker_symbol).financials.T.sort_index()
+            for field, names in income_statement_fields.items():
+                yahoo_values = _reindex_nearest(_statement_series(yahoo_income_statement, names), income_statement.index)
+                existing_values = _statement_series(income_statement, [field])
+                income_statement[field] = existing_values.combine_first(yahoo_values)
         except Exception:
             pass
 
