@@ -168,31 +168,66 @@ def _latest_statement_value(statement, names):
     return None
 
 
-def _dampen_outlier_weights(values):
-    """Return weights that down-weight statistical outlier years via MAD so a
-    one-off spike/drop (e.g., a divestiture or impairment) doesn't dominate a
-    multi-year average. Outlier years get ~35% of an equal weight (e.g., ~7%
-    instead of 20% for a 5-year window); remaining years are renormalized.
-    Applies the same way regardless of ticker.
+def _flag_giant_outliers(values, multiple=4.0):
+    """Flag values at least `multiple`x the size of the next-largest value on
+    the same side (upside vs. downside) — i.e., truly extreme, unlikely-to-recur
+    swings (e.g., a COVID-era demand spike), as distinct from a merely large but
+    plausible year. Requires at least two values on a side to form the ratio.
     """
-    n = len(values)
+    arr = np.asarray(values, dtype=float)
+    is_giant = np.zeros(len(arr), dtype=bool)
+
+    positives = np.sort(arr[arr > 0])[::-1]
+    if len(positives) >= 2 and positives[1] > 0 and positives[0] >= multiple * positives[1]:
+        is_giant |= np.isclose(arr, positives[0])
+
+    negatives = np.sort(arr[arr < 0])
+    if len(negatives) >= 2 and negatives[1] < 0 and abs(negatives[0]) >= multiple * abs(negatives[1]):
+        is_giant |= np.isclose(arr, negatives[0])
+
+    return is_giant
+
+
+def _outlier_weights(values, giant_multiple=4.0, giant_weight=0.15, moderate_weight=0.35, moderate_z=2.0):
+    """Base (pre-recency) weights that down-weight outlier years in two tiers:
+    - Giant outliers (>= `giant_multiple`x the next-largest same-direction value)
+      get `giant_weight` of an equal share — reserved for truly extreme, rare swings.
+    - Moderate statistical outliers (MAD modified z-score beyond `moderate_z`)
+      get `moderate_weight` of an equal share.
+    Everything else keeps full weight. Applies the same way regardless of ticker.
+    """
+    arr = values.to_numpy() if hasattr(values, "to_numpy") else np.asarray(values, dtype=float)
+    n = len(arr)
     weights = np.ones(n)
+
     if n > 2:
-        median = values.median()
-        mad = (values - median).abs().median()
+        median = np.median(arr)
+        mad = np.median(np.abs(arr - median))
         if mad > 0:
-            modified_z_scores = 0.6745 * (values - median) / mad
-            weights = np.where(modified_z_scores.abs() > 2.0, 0.35, 1.0).astype(float)
+            modified_z_scores = 0.6745 * (arr - median) / mad
+            weights = np.where(np.abs(modified_z_scores) > moderate_z, moderate_weight, 1.0)
+
+    giant_mask = _flag_giant_outliers(arr, multiple=giant_multiple)
+    weights = np.where(giant_mask, giant_weight, weights)
+    return weights
+
+
+def _dampen_outlier_weights(values):
+    """Return normalized weights that down-weight statistical/giant outlier
+    years so a one-off spike/drop (e.g., a divestiture or impairment) doesn't
+    dominate a multi-year average. Applies the same way regardless of ticker.
+    """
+    weights = _outlier_weights(values)
     return weights / weights.sum()
 
 
 def _recency_weighted_average(values, decay=0.65):
-    """Exponentially recency-weighted average (most recent year weighted
-    heaviest). Used for metrics like margins, return on capital, and growth
-    where a company can undergo a genuine structural shift (e.g., margin
-    expansion/contraction) that a flat multi-year average would understate;
-    this is distinct from one-off statistical outliers. Applies the same way
-    regardless of ticker.
+    """Outlier-dampened, exponentially recency-weighted average (most recent
+    year weighted heaviest). Used for metrics like margins, return on capital,
+    and growth where a company can undergo a genuine structural shift (e.g.,
+    margin expansion/contraction) that a flat multi-year average would
+    understate, while still suppressing rare, giant one-off swings. Applies
+    the same way regardless of ticker.
     """
     values = pd.to_numeric(values, errors="coerce").dropna()
     n = len(values)
@@ -201,22 +236,11 @@ def _recency_weighted_average(values, decay=0.65):
     if n == 1:
         return float(values.iloc[0])
 
-    weights = np.array([decay ** (n - 1 - i) for i in range(n)])
+    base_weights = _outlier_weights(values)
+    recency_weights = np.array([decay ** (n - 1 - i) for i in range(n)])
+    weights = base_weights * recency_weights
     weights = weights / weights.sum()
     return float(np.average(values.to_numpy(), weights=weights))
-
-
-def _average_annual_growth(series):
-    """Compute a recency-weighted average of year-over-year growth rates."""
-    values = pd.to_numeric(series, errors="coerce").dropna()
-    if values.empty or len(values) < 2:
-        return 0.0
-
-    yoy_growth = values.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
-    if yoy_growth.empty:
-        return 0.0
-
-    return _recency_weighted_average(yoy_growth)
 
 
 def _average_historical_reinvestment_rate(stats, fallback=0.25):
@@ -822,11 +846,9 @@ def get_projection_defaults_from_data(historical_data):
     for column, fallback in fallback_values.items():
         values = stats[column].dropna()
         defaults[column] = _recency_weighted_average(values) if not values.empty else fallback
-    revenue_series = income_statement.get('Total Revenue') if isinstance(income_statement, pd.DataFrame) else None
-    if revenue_series is not None:
-        defaults['Revenue Growth'] = _average_annual_growth(revenue_series)
 
     ebit_series = income_statement.get('EBIT') if isinstance(income_statement, pd.DataFrame) else None
+    revenue_series = income_statement.get('Total Revenue') if isinstance(income_statement, pd.DataFrame) else None
     no_positive_operations = (
         revenue_series is not None
         and revenue_series.fillna(0).sum() <= 0
@@ -1363,7 +1385,7 @@ def render_historical():
                 avg_col1, avg_col2, avg_col3, avg_col4 = st.columns(4)
 
                 with avg_col1:
-                    avg_rev_growth = _average_annual_growth(income_statement['Total Revenue'])
+                    avg_rev_growth = _recency_weighted_average(df_stats['Revenue Growth'])
                     st.metric("Avg Revenue Growth", f"{avg_rev_growth:.2%}")
 
                 with avg_col2:
