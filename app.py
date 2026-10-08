@@ -557,8 +557,8 @@ def _get_sec_cik(ticker_symbol):
     raise ValueError(f"SEC did not return a CIK for ticker {ticker_symbol}.")
 
 
-def _sec_fact_series(facts, tags):
-    """Return the latest annual SEC fact for each fiscal year-end, merging tags."""
+def _sec_fact_series(facts, tags, take_max=False):
+    """Return the latest annual SEC fact for each fiscal year-end, merging tags (first tag wins, or the largest if take_max)."""
     us_gaap = facts.get("facts", {}).get("us-gaap", {})
     combined = pd.Series(dtype="float64")
 
@@ -594,7 +594,7 @@ def _sec_fact_series(facts, tags):
             index=fact_frame["end"].dt.normalize(),
             dtype="float64",
         ).sort_index()
-        combined = combined.combine_first(current)
+        combined = combined.combine(current, max) if take_max else combined.combine_first(current)
 
     return combined.sort_index()
 
@@ -653,7 +653,17 @@ def get_sec_historical_statements(ticker_symbol):
     )
     capital_expenditure = _sec_fact_series(
         facts,
-        ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets"],
+        [
+            "PaymentsToAcquirePropertyPlantAndEquipment",
+            "PaymentsToAcquireProductiveAssets",
+            "PaymentsToAcquireOtherPropertyPlantAndEquipment",
+            "PaymentsForCapitalImprovements",
+            "PaymentsToAcquireRealEstate",
+            "PaymentsToAcquireOilAndGasPropertyAndEquipment",
+            "PaymentsToDevelopRealEstateAssets",
+            "PaymentsToAcquireRealEstateHeldForInvestment",
+        ],
+        take_max=True,
     )
     depreciation = _sec_fact_series(
         facts,
@@ -700,6 +710,15 @@ def get_sec_historical_statements(ticker_symbol):
     return income_statement, balance_sheet, cash_flows
 
 
+def _widest_capex(statement):
+    """Largest capex measure per period (positive) across Yahoo's capex line variants."""
+    candidates = [
+        _statement_series(statement, [name]).abs()
+        for name in ('Capital Expenditure', 'Capital Expenditure Reported', 'Purchase Of PPE')
+    ]
+    return pd.concat(candidates, axis=1).max(axis=1, skipna=True)
+
+
 def _get_yahoo_historical_statements(ticker_symbol):
     """Fetch Yahoo annual statements for companies with incomplete SEC coverage."""
     ticker = yf.Ticker(ticker_symbol)
@@ -731,7 +750,10 @@ def get_historical_data(ticker_symbol):
         try:
             yahoo_cash_flows = yf.Ticker(ticker_symbol).cashflow.T.sort_index()
             for field, names in cash_flow_fields.items():
-                yahoo_values = _reindex_nearest(_statement_series(yahoo_cash_flows, names), cash_flows.index)
+                if field == "Capital Expenditure":
+                    yahoo_values = _reindex_nearest(-_widest_capex(yahoo_cash_flows), cash_flows.index)
+                else:
+                    yahoo_values = _reindex_nearest(_statement_series(yahoo_cash_flows, names), cash_flows.index)
                 existing_values = _statement_series(cash_flows, [field])
                 cash_flows[field] = existing_values.combine_first(yahoo_values)
         except Exception:
@@ -873,9 +895,8 @@ def get_historical_data(ticker_symbol):
     balance_sheet = balance_sheet.reindex(historical_periods)
 
     # Process cash flows
-    cash_flows['Capital Expenditure'] = -_statement_series(
-        cash_flows, ['Capital Expenditure'], default=0
-    )
+    widest_capex = _widest_capex(cash_flows)
+    cash_flows['Capital Expenditure'] = widest_capex.fillna(0) if widest_capex.isna().all() else widest_capex
     cash_flows['Depreciation And Amortization'] = _statement_series(
         cash_flows,
         ['Depreciation And Amortization', 'Depreciation Amortization Depletion', 'Depreciation'],
@@ -1129,7 +1150,17 @@ def build_dcf_projections(ltm_revenue, most_recent_date, growth_rates, ebit_marg
     return projections
 
 
-def calculate_dcf_valuation(projections, wacc, terminal_growth, total_debt, total_cash, shares_outstanding):
+def get_terminal_reinvestment_rate(historical_data, terminal_growth, wacc):
+    """Terminal reinvestment rate = g / ROC, so terminal FCF matches the terminal growth assumed."""
+    stats = historical_data['df_stats'].replace([np.inf, -np.inf], np.nan)
+    roc = _recency_weighted_average(stats['Return on Capital'].dropna())
+    if not np.isfinite(roc) or roc <= 0:
+        roc = wacc
+    return float(min(max(terminal_growth / roc, 0.0), 0.9))
+
+
+def calculate_dcf_valuation(projections, wacc, terminal_growth, total_debt, total_cash, shares_outstanding,
+                            terminal_reinvestment_rate=None):
     """Calculate DCF valuation and implied share price."""
     time_horizon = len(projections)
 
@@ -1147,8 +1178,10 @@ def calculate_dcf_valuation(projections, wacc, terminal_growth, total_debt, tota
     pv_fcf = projections['Discounted_FCF'].sum()
 
     # Terminal value using Gordon Growth Model
-    final_fcf = projections.iloc[-1]['FCF']
-    terminal_value = final_fcf * (1 + terminal_growth) / (wacc - terminal_growth)
+    if terminal_reinvestment_rate is None:
+        terminal_reinvestment_rate = projections.iloc[-1]['Reinv Rate']
+    terminal_fcf = projections.iloc[-1]['NOPAT'] * (1 + terminal_growth) * (1 - terminal_reinvestment_rate)
+    terminal_value = terminal_fcf / (wacc - terminal_growth)
     pv_terminal = terminal_value / (1 + wacc) ** time_horizon
 
     # Enterprise value and equity value
@@ -1159,6 +1192,8 @@ def calculate_dcf_valuation(projections, wacc, terminal_growth, total_debt, tota
     return {
         'pv_fcf': pv_fcf,
         'terminal_value': terminal_value,
+        'terminal_fcf': terminal_fcf,
+        'terminal_reinvestment_rate': terminal_reinvestment_rate,
         'pv_terminal': pv_terminal,
         'enterprise_value': enterprise_value,
         'equity_value': equity_value,
@@ -1220,7 +1255,7 @@ def render_home():
         st.latex(r"FCF = NOPAT \times (1 - ReinvestmentRate)")
 
         st.markdown("**Terminal Value**")
-        st.latex(r"TV = \frac{FCF_{final} \times (1 + g)}{WACC - g}")
+        st.latex(r"TV = \frac{NOPAT_{final} \times (1 + g) \times (1 - g/ROC)}{WACC - g}")
 
     st.markdown("<div style='height: .5rem'></div>", unsafe_allow_html=True)
     st.caption("Built for MGT6534 | Market and financial statement data from Yahoo Finance")
@@ -1715,9 +1750,16 @@ def render_dcf():
                 )
 
                 # Calculate valuation
+                if st.session_state.get("historical_analysis_ticker") == ticker_symbol and st.session_state.get("historical_analysis_data") is not None:
+                    terminal_hist = st.session_state["historical_analysis_data"]
+                else:
+                    terminal_hist = get_historical_data(ticker_symbol)
+                terminal_reinv = get_terminal_reinvestment_rate(terminal_hist, terminal_growth, wacc)
+
                 valuation = calculate_dcf_valuation(
                     projections, wacc, terminal_growth,
-                    total_debt, total_cash, shares_outstanding
+                    total_debt, total_cash, shares_outstanding,
+                    terminal_reinvestment_rate=terminal_reinv
                 )
 
                 # === Display Projections ===
@@ -1746,10 +1788,10 @@ def render_dcf():
                 # === Terminal Value ===
                 st.markdown("### Terminal Value")
 
-                st.latex(r"TV = \frac{FCF_{final} \times (1 + g)}{WACC - g}")
+                st.latex(r"TV = \frac{NOPAT_{final} \times (1 + g) \times (1 - g/ROC)}{WACC - g}")
 
-                final_fcf = projections.iloc[-1]['FCF']
-                st.write(f"TV = ({final_fcf/scale_factor:,.2f} × (1 + {terminal_growth:.2%})) / ({wacc:.2%} - {terminal_growth:.2%})")
+                final_nopat = projections.iloc[-1]['NOPAT']
+                st.write(f"TV = ({final_nopat/scale_factor:,.2f} × (1 + {terminal_growth:.2%}) × (1 - {terminal_reinv:.2%})) / ({wacc:.2%} - {terminal_growth:.2%})")
 
                 col_tv1, col_tv2 = st.columns(2)
                 with col_tv1:
@@ -1815,7 +1857,8 @@ def render_dcf():
                     )
                     val = calculate_dcf_valuation(
                         proj_copy, w, terminal_growth,
-                        total_debt, total_cash, shares_outstanding
+                        total_debt, total_cash, shares_outstanding,
+                        terminal_reinvestment_rate=get_terminal_reinvestment_rate(terminal_hist, terminal_growth, w)
                     )
                     sensitivity_results.append({
                         'WACC': f"{w:.2%}",
