@@ -1116,17 +1116,15 @@ def get_projection_defaults_from_data(historical_data):
         if values.empty:
             defaults[column] = fallback
         elif column == 'Reinv Rate':
-            # Overwritten below by _average_historical_reinvestment_rate (MAD +
-            # giant-outlier dampening, no recency tilt); placeholder for now.
             defaults[column] = fallback
         elif column == 'Revenue Growth':
-            # Hard +/-40% threshold, not a ratio-based rule; no recency tilt.
-            # Start from the latest LTM growth (through the newest quarter) so
-            # a recent inflection isn't diluted by older down years; capped at +/-40%.
-            defaults[column] = float(np.clip(values.iloc[-1], -0.40, 0.40))
+            hist_avg = _average_revenue_growth(values)
+            recent_val = float(np.clip(values.iloc[-1], -0.40, 0.40))
+            if len(values) >= 2 and np.isfinite(hist_avg) and abs(recent_val - hist_avg) > 0.02:
+                defaults[column] = (recent_val, hist_avg)
+            else:
+                defaults[column] = recent_val
         else:
-            # EBIT Margin: only suppress true giant outliers (4x rule),
-            # no moderate MAD dampening or recency tilt.
             defaults[column] = _average_dampening_giant_outliers_only(values)
 
     ebit_series = income_statement.get('EBIT') if isinstance(income_statement, pd.DataFrame) else None
@@ -1178,9 +1176,14 @@ def expand_projection_input(raw_value, label, horizon=None):
         return values
     if len(values) == 1:
         return values * horizon
+    if len(values) == 2 and horizon > 2:
+        # Two values map to years 1-5 and years 6-10 (or first half and second half)
+        first_half = horizon // 2
+        second_half = horizon - first_half
+        return [values[0]] * first_half + [values[1]] * second_half
     if len(values) == horizon:
         return values
-    raise ValueError(f"{label} must contain one value or exactly {horizon} yearly values.")
+    raise ValueError(f"{label} must contain one value, two values (for 2-stage horizons), or exactly {horizon} yearly values.")
 
 
 def get_ltm_revenue(ticker_symbol):
@@ -1676,27 +1679,37 @@ def render_historical():
                 st.caption(f"NOPAT and Reinvestment in {scale_name}")
 
                 # Averages for quick reference
-                st.markdown("### Historical Averages (for projections)")
+                st.markdown("### Historical Averages & Latest Run-rate (for projections)")
 
                 avg_col1, avg_col2, avg_col3, avg_col4 = st.columns(4)
 
                 with avg_col1:
                     avg_rev_growth = _average_revenue_growth(df_stats['Revenue Growth'])
-                    st.metric("Avg Revenue Growth", f"{avg_rev_growth:.2%}")
+                    latest_rev_growth = df_stats['Revenue Growth'].dropna().iloc[-1] if not df_stats['Revenue Growth'].dropna().empty else avg_rev_growth
+                    st.metric(
+                        "Avg Revenue Growth",
+                        f"{avg_rev_growth:.2%}",
+                        help="Multi-year historical average revenue growth"
+                    )
+                    st.caption(f"**Latest Run-Rate (2026):** {latest_rev_growth:.2%}")
 
                 with avg_col2:
                     avg_ebit_margin = _average_dampening_giant_outliers_only(df_stats['EBIT Margin'])
+                    latest_ebit_margin = df_stats['EBIT Margin'].dropna().iloc[-1] if not df_stats['EBIT Margin'].dropna().empty else avg_ebit_margin
                     st.metric("Avg EBIT Margin", f"{avg_ebit_margin:.2%}")
-                    st.caption("Only true giant outliers (4x rule) are down-weighted.")
+                    st.caption(f"**Latest Run-Rate (2026):** {latest_ebit_margin:.2%}")
 
                 with avg_col3:
                     avg_tax_rate = df_stats['Eff Tax Rate'].mean()
+                    latest_tax_rate = df_stats['Eff Tax Rate'].dropna().iloc[-1] if not df_stats['Eff Tax Rate'].dropna().empty else avg_tax_rate
                     st.metric("Avg Eff Tax Rate", f"{avg_tax_rate:.2%}")
+                    st.caption(f"**Latest (2026):** {latest_tax_rate:.2%}")
 
                 with avg_col4:
                     avg_reinv_rate = _average_historical_reinvestment_rate(df_stats)
+                    latest_reinv_rate = df_stats['Reinv Rate'].dropna().iloc[-1] if not df_stats['Reinv Rate'].dropna().empty else avg_reinv_rate
                     st.metric("Avg Reinv Rate", f"{avg_reinv_rate:.2%}")
-                    st.caption("Outlier years are down-weighted (not a simple mean).")
+                    st.caption(f"**Latest Run-Rate (2026):** {latest_reinv_rate:.2%}")
 
             except Exception as e:
                 st.error(f"Error: {str(e)}")
@@ -1739,7 +1752,11 @@ def render_dcf():
                 ("dcf_margin_input", "EBIT Margin"),
                 ("dcf_reinvestment_input", "Reinv Rate"),
             ):
-                st.session_state[key] = f"{projection_defaults[column] * 100:.2f}"
+                val = projection_defaults[column]
+                if isinstance(val, (tuple, list)):
+                    st.session_state[key] = f"{val[0] * 100:.2f}, {val[1] * 100:.2f}"
+                else:
+                    st.session_state[key] = f"{val * 100:.2f}"
 
             if st.session_state.get("wacc_calculated_ticker") == ticker_symbol:
                 st.session_state["dcf_wacc_rate"] = st.session_state["wacc_calculated_rate"] * 100
