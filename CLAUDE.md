@@ -116,3 +116,12 @@ The original Colab notebooks are preserved as reference:
   - Full valuation summary table
 - Pushed code to GitHub: jblocher/mgt6534-dcf-0945-2025
 - Prepared for Streamlit Cloud deployment
+
+### 2026 Valuation Update
+- Expanded historical analysis target window from 2021-2025 to 2021-2026.
+- Added `_augment_with_latest_quarterly` helper to ingest 2026 quarterly performance (Q1 & Q2):
+  - Trailing 4-quarter aggregation for flow metrics (Revenue, EBIT, Gross Profit, Pretax/Net Income, Tax, CapEx, D&A) through the latest 2026 quarter to produce a consistent 12-month run-rate.
+  - Point-in-time balance sheet items (Cash, Current Assets/Liabilities, Debt, Equity) mapped to latest 2026 reported quarter.
+  - Dynamically aligned column discrepancies between SEC XBRL and Yahoo statements.
+- Historical Analysis (Tab 2) displays 2026 metrics, NWC changes, and AI infrastructure reinvestment surges.
+- DCF Model (Tab 3) automatically reflects updated 2026 historical averages for revenue growth, margins, and reinvestment rate defaults.

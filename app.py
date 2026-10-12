@@ -725,6 +725,105 @@ def _get_yahoo_historical_statements(ticker_symbol):
     return ticker.financials.T.sort_index(), ticker.balance_sheet.T.sort_index(), ticker.cashflow.T.sort_index()
 
 
+def _augment_with_latest_quarterly(ticker_symbol, income_statement, balance_sheet, cash_flows):
+    """Augment historical annual statements with latest 2026 trailing 12-month (LTM) quarterly data."""
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        qi = None
+        for getter in (lambda: ticker.quarterly_income_stmt, lambda: ticker.quarterly_financials):
+            try:
+                stmt = getter()
+                if stmt is not None and not stmt.empty:
+                    qi = stmt.T.sort_index()
+                    break
+            except Exception:
+                continue
+
+        if qi is None or qi.empty:
+            return income_statement, balance_sheet, cash_flows
+
+        qb = None
+        try:
+            if ticker.quarterly_balance_sheet is not None and not ticker.quarterly_balance_sheet.empty:
+                qb = ticker.quarterly_balance_sheet.T.sort_index()
+        except Exception:
+            pass
+
+        qc = None
+        try:
+            if ticker.quarterly_cashflow is not None and not ticker.quarterly_cashflow.empty:
+                qc = ticker.quarterly_cashflow.T.sort_index()
+        except Exception:
+            pass
+
+        # Identify latest valid quarter with revenue in 2026
+        rev_quarterly = _statement_series(qi, ['Total Revenue', 'Operating Revenue']).dropna()
+        if rev_quarterly.empty:
+            return income_statement, balance_sheet, cash_flows
+
+        quarters_2026 = rev_quarterly.index[rev_quarterly.index.year == 2026]
+        if quarters_2026.empty:
+            return income_statement, balance_sheet, cash_flows
+
+        latest_q = quarters_2026.max()
+        annual_max = income_statement.index.max() if not income_statement.empty else None
+
+        # Augment when latest 2026 quarter is after the latest annual statement,
+        # or if the latest annual statement is before 2026.
+        if len(rev_quarterly.loc[:latest_q]) >= 4 and (
+            annual_max is None or latest_q > annual_max or annual_max.year < 2026
+        ):
+            tail_qi = qi.loc[:latest_q].tail(4)
+            tail_qc = qc.loc[:latest_q].tail(4) if qc is not None and not qc.empty else pd.DataFrame()
+            latest_qb = qb.loc[:latest_q].iloc[-1] if qb is not None and not qb.empty else pd.Series()
+            df_q = pd.DataFrame([latest_qb]) if not latest_qb.empty else pd.DataFrame()
+
+            # Income statement flow items (sum trailing 4 quarters)
+            income_statement.loc[latest_q, 'Total Revenue'] = _statement_series(tail_qi, ['Total Revenue', 'Operating Revenue']).sum()
+            income_statement.loc[latest_q, 'EBIT'] = _statement_series(tail_qi, ['EBIT', 'Operating Income']).sum()
+            income_statement.loc[latest_q, 'Gross Profit'] = _statement_series(tail_qi, ['Gross Profit']).sum()
+            income_statement.loc[latest_q, 'Cost Of Revenue'] = _statement_series(tail_qi, ['Cost Of Revenue']).sum()
+            income_statement.loc[latest_q, 'Tax Provision'] = _statement_series(tail_qi, ['Tax Provision']).sum()
+            income_statement.loc[latest_q, 'Pretax Income'] = _statement_series(tail_qi, ['Pretax Income']).sum()
+            income_statement.loc[latest_q, 'Net Income'] = _statement_series(tail_qi, ['Net Income', 'Net Income Common Stockholders']).sum()
+            income_statement.loc[latest_q, 'Interest Expense'] = _statement_series(tail_qi, ['Interest Expense', 'Interest Expense Non Operating']).sum()
+
+            # Balance sheet point-in-time items (as of latest quarter)
+            if not df_q.empty:
+                for col in balance_sheet.columns:
+                    if col == 'Current Assets':
+                        balance_sheet.loc[latest_q, col] = _statement_series(df_q, ['Current Assets'], default=0).iloc[0]
+                    elif col == 'Current Liabilities':
+                        balance_sheet.loc[latest_q, col] = _statement_series(df_q, ['Current Liabilities'], default=0).iloc[0]
+                    elif col == 'Cash And Cash Equivalents':
+                        balance_sheet.loc[latest_q, col] = _statement_series(df_q, ['Cash And Cash Equivalents'], default=0).iloc[0]
+                    elif col == 'Cash Cash Equivalents And Short Term Investments':
+                        balance_sheet.loc[latest_q, col] = _statement_series(df_q, ['Cash Cash Equivalents And Short Term Investments'], default=0).iloc[0]
+                    elif col in ('Current Debt', 'Current Debt And Capital Lease Obligation'):
+                        balance_sheet.loc[latest_q, col] = _statement_series(df_q, ['Current Debt And Capital Lease Obligation', 'Current Debt'], default=0).iloc[0]
+                    elif col in ('Long Term Debt And Capital Lease Obligation', 'Long Term Debt'):
+                        balance_sheet.loc[latest_q, col] = _statement_series(df_q, ['Long Term Debt And Capital Lease Obligation', 'Long Term Debt'], default=0).iloc[0]
+                    elif col == 'Total Debt':
+                        balance_sheet.loc[latest_q, col] = _statement_series(df_q, ['Total Debt'], default=0).iloc[0]
+                    elif col in ('Stockholders Equity', 'Common Stock Equity', 'Total Equity Gross Minority Interest'):
+                        balance_sheet.loc[latest_q, col] = _statement_series(df_q, ['Stockholders Equity', 'Common Stock Equity', 'Total Equity Gross Minority Interest'], default=0).iloc[0]
+
+            # Cash flows flow items (sum trailing 4 quarters)
+            if not tail_qc.empty:
+                ltm_capex = -_widest_capex(tail_qc).sum()
+                ltm_da = _statement_series(
+                    tail_qc,
+                    ['Depreciation And Amortization', 'Depreciation Amortization Depletion', 'Depreciation']
+                ).abs().sum()
+                cash_flows.loc[latest_q, 'Capital Expenditure'] = ltm_capex
+                cash_flows.loc[latest_q, 'Depreciation And Amortization'] = ltm_da
+
+    except Exception:
+        pass
+
+    return income_statement, balance_sheet, cash_flows
+
+
 def get_historical_data(ticker_symbol):
     """Fetch and process historical financial data, preferring SEC annual filings."""
     using_sec = True
@@ -780,18 +879,26 @@ def get_historical_data(ticker_symbol):
         except Exception:
             pass
 
+    # Augment with latest 2026 quarterly data (Q1 & Q2 LTM)
+    income_statement, balance_sheet, cash_flows = _augment_with_latest_quarterly(
+        ticker_symbol, income_statement, balance_sheet, cash_flows
+    )
+
     revenue_for_window = _statement_series(
         income_statement,
         ['Total Revenue', 'Operating Revenue'],
     ).dropna().sort_index()
-    target_years = set(range(2021, 2026))
+    target_years = set(range(2021, 2027))
     available_target_periods = revenue_for_window.index[
         revenue_for_window.index.year.isin(target_years)
     ]
-    if using_sec and len(available_target_periods) != len(target_years):
+    if using_sec and len(available_target_periods) < 4:
         try:
             income_statement, balance_sheet, cash_flows = _get_yahoo_historical_statements(ticker_symbol)
             using_sec = False
+            income_statement, balance_sheet, cash_flows = _augment_with_latest_quarterly(
+                ticker_symbol, income_statement, balance_sheet, cash_flows
+            )
             revenue_for_window = _statement_series(
                 income_statement,
                 ['Total Revenue', 'Operating Revenue'],
@@ -802,13 +909,6 @@ def get_historical_data(ticker_symbol):
         except Exception:
             pass
 
-    revenue_growth = revenue_for_window.pct_change().replace([np.inf, -np.inf], np.nan)
-    revenue_growth_change = revenue_growth.diff()
-    ebit_for_growth = _statement_series(
-        income_statement,
-        ['EBIT', 'Operating Income'],
-    ).dropna().sort_index()
-    ebit_growth = ebit_for_growth.pct_change().replace([np.inf, -np.inf], np.nan)
     historical_periods = available_target_periods
     historical_periods = historical_periods[~historical_periods.year.duplicated(keep='last')]
     if len(historical_periods) < 2:
@@ -817,6 +917,16 @@ def get_historical_data(ticker_symbol):
         raise ValueError(f"No sufficient annual revenue history was returned for {ticker_symbol}.")
     prior_period = revenue_for_window.index[revenue_for_window.index < historical_periods[0]][-1:]
     balance_periods = prior_period.append(historical_periods)
+
+    rev_hist = revenue_for_window.reindex(balance_periods)
+    revenue_growth = rev_hist.pct_change().reindex(historical_periods).replace([np.inf, -np.inf], np.nan)
+    revenue_growth_change = revenue_growth.diff()
+    ebit_for_growth = _statement_series(
+        income_statement,
+        ['EBIT', 'Operating Income'],
+    ).dropna().sort_index().reindex(balance_periods)
+    ebit_growth = ebit_for_growth.pct_change().reindex(historical_periods).replace([np.inf, -np.inf], np.nan)
+
     income_statement = income_statement.reindex(historical_periods)
     balance_sheet = balance_sheet.reindex(balance_periods)
     cash_flows = cash_flows.reindex(historical_periods)
