@@ -919,13 +919,22 @@ def get_historical_data(ticker_symbol):
     balance_periods = prior_period.append(historical_periods)
 
     rev_hist = revenue_for_window.reindex(balance_periods)
-    revenue_growth = rev_hist.pct_change().reindex(historical_periods).replace([np.inf, -np.inf], np.nan)
+    def _annualized_pct_change(series):
+        # Rolling LTM periods can be less than a year apart (e.g. 12/31/25 -> 6/30/26),
+        # so scale each change to a 365-day rate.
+        gap_years = pd.Series(series.index, index=series.index).diff().dt.days / 365.25
+        growth = series.pct_change()
+        short = gap_years.notna() & (gap_years < 0.9)
+        annualized = (1 + growth).clip(lower=0) ** (1 / gap_years) - 1
+        return growth.where(~short, annualized)
+
+    revenue_growth = _annualized_pct_change(rev_hist).reindex(historical_periods).replace([np.inf, -np.inf], np.nan)
     revenue_growth_change = revenue_growth.diff()
     ebit_for_growth = _statement_series(
         income_statement,
         ['EBIT', 'Operating Income'],
     ).dropna().sort_index().reindex(balance_periods)
-    ebit_growth = ebit_for_growth.pct_change().reindex(historical_periods).replace([np.inf, -np.inf], np.nan)
+    ebit_growth = _annualized_pct_change(ebit_for_growth).reindex(historical_periods).replace([np.inf, -np.inf], np.nan)
 
     income_statement = income_statement.reindex(historical_periods)
     balance_sheet = balance_sheet.reindex(balance_periods)
@@ -1112,7 +1121,9 @@ def get_projection_defaults_from_data(historical_data):
             defaults[column] = fallback
         elif column == 'Revenue Growth':
             # Hard +/-40% threshold, not a ratio-based rule; no recency tilt.
-            defaults[column] = _average_revenue_growth(values)
+            # Start from the latest LTM growth (through the newest quarter) so
+            # a recent inflection isn't diluted by older down years; capped at +/-40%.
+            defaults[column] = float(np.clip(values.iloc[-1], -0.40, 0.40))
         else:
             # EBIT Margin: only suppress true giant outliers (4x rule),
             # no moderate MAD dampening or recency tilt.
