@@ -40,7 +40,8 @@ The app (`app.py`) uses a tabbed interface with four sections:
 
 ### Tab 1: WACC Calculator
 - Inputs: Ticker symbol, risk-free rate, EMRP, credit rating, tax rate
-- Calculates beta via OLS regression (5-year monthly returns vs S&P 500)
+- Beta: average of Blume-adjusted OLS regression (5-year monthly vs S&P 500) and Damodaran bottom-up industry beta (selectable)
+- ERP, industry betas, and credit spreads fetched live from Damodaran's site (cached daily, stored fallbacks)
 - Computes cost of equity (CAPM), cost of debt, and WACC
 - Displays capital structure weights and summary table
 

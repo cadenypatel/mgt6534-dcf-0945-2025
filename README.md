@@ -11,7 +11,8 @@ Deploy your own instance via [Streamlit Cloud](https://share.streamlit.io)
 ## Features
 
 ### WACC Calculator
-- Calculates beta via OLS regression (5-year monthly returns vs S&P 500)
+- Beta (default): average of the Blume-adjusted OLS regression beta (5-year monthly returns vs S&P 500) and Damodaran's bottom-up industry beta relevered at the firm's D/E; either can be selected alone
+- Equity risk premium, industry betas, and rating spreads are fetched live from Damodaran's latest datasets (cached daily, with stored fallbacks)
 - Cost of equity using CAPM (risk-free rate + beta × equity market risk premium)
 - Cost of debt using risk-free rate + credit spread (Damodaran lookup table)
 - Weighted average based on market cap and total debt

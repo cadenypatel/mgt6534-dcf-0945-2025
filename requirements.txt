@@ -5,3 +5,5 @@ requests
 yfinance
 statsmodels
 matplotlib
+openpyxl
+lxml
