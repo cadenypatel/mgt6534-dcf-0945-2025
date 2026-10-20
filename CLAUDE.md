@@ -94,7 +94,7 @@ The original Colab notebooks are preserved as reference:
 - Cost of Equity (CAPM): k_E = r_f + β × EMRP
 - Cost of Debt: k_D = r_f + credit_spread
 - NOPAT = EBIT × (1 - Tax Rate)
-- Reinvestment = ΔRevenue / Sales-to-Capital; FCF = NOPAT - Reinvestment
+- FCF = NOPAT × (1 - Reinvestment Rate); reinvestment pre-fills from the last 3 years, fading to g / RONIC
 - Terminal Value = NOPAT_final × (1 + g) × (1 - g/RONIC) / (WACC - g), mid-year discounting
 - Enterprise Value = PV(FCFs) + PV(Terminal Value)
 - Equity Value = Enterprise Value - Debt + Cash + Non-operating Investments - Minority Interest
