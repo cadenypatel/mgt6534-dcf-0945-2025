@@ -1075,13 +1075,10 @@ def get_historical_data(ticker_symbol):
     }
 
 
-def calculate_terminal_growth_rate(historical_data, wacc):
-    """Estimate sustainable terminal growth from historical reinvestment and ROC."""
+def calculate_terminal_growth_rate(historical_data):
+    """Estimate sustainable perpetual growth from historical reinvestment and ROC."""
     stats = historical_data['df_stats'].replace([np.inf, -np.inf], np.nan)
     average_return_on_capital = _recency_weighted_average(stats['Return on Capital'].dropna())
-    income_statement = historical_data.get('income_statement', pd.DataFrame())
-    revenue_series = income_statement.get('Total Revenue') if isinstance(income_statement, pd.DataFrame) else None
-
     average_reinvestment = _average_historical_reinvestment_rate(stats)
     if np.isfinite(average_return_on_capital) and average_return_on_capital > 0:
         raw_growth = average_reinvestment * average_return_on_capital
@@ -1094,10 +1091,7 @@ def calculate_terminal_growth_rate(historical_data, wacc):
         raw_growth = 0.03
         method = 'Default long-term growth assumption'
 
-    # Keep terminal value from dominating when growth approaches the discount rate.
-    maximum_growth = min(0.03, max(0.0, wacc - 0.02))
-    recommended_growth = min(max(float(raw_growth), 0.0), maximum_growth)
-    return recommended_growth, average_reinvestment, average_return_on_capital, method
+    return float(raw_growth), average_reinvestment, average_return_on_capital, method
 
 
 def get_projection_defaults_from_data(historical_data):
@@ -1119,7 +1113,7 @@ def get_projection_defaults_from_data(historical_data):
             defaults[column] = fallback
         elif column == 'Revenue Growth':
             hist_avg = _average_revenue_growth(values)
-            recent_val = float(np.clip(values.iloc[-1], -0.40, 0.40))
+            recent_val = float(values.iloc[-1])
             if len(values) >= 2 and np.isfinite(hist_avg) and abs(recent_val - hist_avg) > 0.02:
                 defaults[column] = (recent_val, hist_avg)
             else:
@@ -1172,6 +1166,8 @@ def expand_projection_input(raw_value, label, horizon=None):
 
     if not values:
         raise ValueError(f"{label} must contain at least one value.")
+    if not np.isfinite(values).all():
+        raise ValueError(f"{label} must contain finite numbers.")
     if horizon is None:
         return values
     if len(values) == 1:
@@ -1244,6 +1240,12 @@ def get_ltm_revenue(ticker_symbol):
 def build_dcf_projections(ltm_revenue, most_recent_date, growth_rates, ebit_margins, reinv_rates, eff_tax_rate):
     """Build projections dataframe for DCF model."""
     time_horizon = len(growth_rates)
+    if time_horizon == 0:
+        raise ValueError("At least one projection year is required.")
+    if not all(np.isfinite(values).all() for values in (growth_rates, ebit_margins, reinv_rates)):
+        raise ValueError("Projection assumptions must contain finite numbers.")
+    if not np.isfinite(ltm_revenue) or not np.isfinite(eff_tax_rate):
+        raise ValueError("LTM revenue and tax rate must be finite numbers.")
 
     # Generate future dates
     freq_dict = {1:'YE-JAN', 2:'YE-FEB', 3:'YE-MAR', 4:'YE-APR', 5:'YE-MAY', 6:'YE-JUN',
@@ -1271,16 +1273,23 @@ def build_dcf_projections(ltm_revenue, most_recent_date, growth_rates, ebit_marg
     projections['FCF'] = projections['NOPAT'] * (1 - projections['Reinv Rate'])
     projections['T'] = range(1, time_horizon + 1)
 
+    if not np.isfinite(projections[['Revenue', 'EBIT', 'NOPAT', 'FCF']].to_numpy()).all():
+        raise ValueError("Projection assumptions produced non-finite financial results.")
+
     return projections
 
 
-def get_terminal_reinvestment_rate(historical_data, terminal_growth, wacc):
+def get_terminal_reinvestment_rate(historical_data, terminal_growth):
     """Terminal reinvestment rate = g / ROC, so terminal FCF matches the terminal growth assumed."""
     stats = historical_data['df_stats'].replace([np.inf, -np.inf], np.nan)
     roc = _recency_weighted_average(stats['Return on Capital'].dropna())
     if not np.isfinite(roc) or roc <= 0:
-        roc = wacc
-    return float(min(max(terminal_growth / roc, 0.0), 0.9))
+        if terminal_growth == 0:
+            return 0.0
+        raise ValueError(
+            "A positive historical return on capital is required to estimate terminal reinvestment."
+        )
+    return float(terminal_growth / roc)
 
 
 def calculate_dcf_valuation(projections, wacc, terminal_growth, total_debt, total_cash, shares_outstanding,
@@ -1288,13 +1297,11 @@ def calculate_dcf_valuation(projections, wacc, terminal_growth, total_debt, tota
     """Calculate DCF valuation and implied share price."""
     time_horizon = len(projections)
 
-    if wacc <= 0:
+    if not np.isfinite(wacc) or wacc <= 0:
         raise ValueError("WACC must be greater than 0%.")
-    if terminal_growth < 0 or terminal_growth >= wacc:
-        raise ValueError("Terminal growth must be non-negative and lower than WACC.")
-    if wacc - terminal_growth < 0.02:
-        raise ValueError("Terminal growth must be at least 2 percentage points below WACC.")
-    if shares_outstanding <= 0:
+    if not np.isfinite(terminal_growth) or terminal_growth >= wacc:
+        raise ValueError("Perpetual growth must be lower than WACC for a finite terminal value.")
+    if not np.isfinite(shares_outstanding) or shares_outstanding <= 0:
         raise ValueError("Shares outstanding must be greater than zero.")
 
     # Discount FCF to present
@@ -1304,6 +1311,8 @@ def calculate_dcf_valuation(projections, wacc, terminal_growth, total_debt, tota
     # Terminal value using Gordon Growth Model
     if terminal_reinvestment_rate is None:
         terminal_reinvestment_rate = projections.iloc[-1]['Reinv Rate']
+    if not np.isfinite(terminal_reinvestment_rate):
+        raise ValueError("Terminal reinvestment rate must be finite.")
     terminal_fcf = projections.iloc[-1]['NOPAT'] * (1 + terminal_growth) * (1 - terminal_reinvestment_rate)
     terminal_value = terminal_fcf / (wacc - terminal_growth)
     pv_terminal = terminal_value / (1 + wacc) ** time_horizon
@@ -1516,21 +1525,21 @@ def render_wacc():
 
                 st.markdown(f"<h1 style='text-align: center; color: #1f77b4;'>WACC = {wacc:.2%}</h1>", unsafe_allow_html=True)
 
-                # Estimate sustainable terminal growth from historical fundamentals.
+                # Estimate sustainable long-term growth from historical fundamentals.
                 try:
                     historical_data = get_historical_data(ticker_symbol)
                     st.session_state["historical_analysis_data"] = historical_data
                     st.session_state["historical_analysis_ticker"] = ticker_symbol
                     st.session_state["dcf_projection_refresh_needed"] = True
                     terminal_growth, average_reinvestment, average_return_on_capital, growth_method = calculate_terminal_growth_rate(
-                        historical_data, wacc
+                        historical_data
                     )
                     st.session_state["wacc_terminal_growth_ticker"] = ticker_symbol
                     st.session_state["wacc_terminal_growth_rate"] = terminal_growth
                     st.session_state["dcf_terminal_growth_rate"] = terminal_growth * 100
                     st.session_state["dcf_wacc_rate"] = wacc * 100
 
-                    st.markdown("**Terminal Growth Rate**")
+                    st.markdown("**Long-Term Growth Rate**")
                     st.latex(r"g = Reinvestment\text{ Rate} \times Return\text{ on Capital}")
                     growth_col1, growth_col2, growth_col3 = st.columns(3)
                     with growth_col1:
@@ -1538,11 +1547,11 @@ def render_wacc():
                     with growth_col2:
                         st.metric("Average Return on Capital", f"{average_return_on_capital:.2%}")
                     with growth_col3:
-                        st.metric("Recommended Terminal Growth", f"{terminal_growth:.2%}")
-                    st.caption(f"{growth_method}. The recommended rate is capped at 3% and kept at least 2 points below WACC for model stability.")
-                    st.info("This recommended terminal growth rate is now loaded into the DCF Model tab.")
+                        st.metric("Recommended Long-Term Growth", f"{terminal_growth:.2%}")
+                    st.caption(f"{growth_method}. This estimate is not capped; it must be lower than WACC to produce a finite terminal value.")
+                    st.info("This recommended long-term growth rate is now loaded into the DCF Model tab.")
                 except Exception as growth_error:
-                    st.warning(f"WACC calculated, but terminal growth could not be estimated from historicals: {growth_error}")
+                    st.warning(f"WACC calculated, but long-term growth could not be estimated from historicals: {growth_error}")
 
                 # Summary table
                 st.markdown("**Summary**")
@@ -1722,6 +1731,10 @@ def render_historical():
 def render_dcf():
     st.header("DCF Model")
     st.markdown("Build the discounted cash flow valuation model to derive an implied share price.")
+    st.caption(
+        "This is a free-cash-flow-to-firm model, not a dividend discount model. "
+        "The long-term growth input is the perpetual rate after the explicit projection period."
+    )
 
     # === Section 1: Basic Inputs ===
     st.markdown("### Company & Valuation Inputs")
@@ -1774,9 +1787,9 @@ def render_dcf():
 
     with col3:
         terminal_growth = st.number_input(
-            "Terminal Growth Rate (%)",
-            min_value=0.0, max_value=5.0, step=0.25, key="dcf_terminal_growth_rate",
-            help="Calculated in the WACC Calculator from historical reinvestment and return on capital"
+            "Long-Term Growth Rate (%)",
+            step=0.25, key="dcf_terminal_growth_rate",
+            help="Uncapped perpetual growth assumption for terminal value. It must be below WACC for the Gordon Growth formula to produce a finite value."
         ) / 100
 
     col4, col5 = st.columns(2)
@@ -1892,7 +1905,7 @@ def render_dcf():
                     terminal_hist = st.session_state["historical_analysis_data"]
                 else:
                     terminal_hist = get_historical_data(ticker_symbol)
-                terminal_reinv = get_terminal_reinvestment_rate(terminal_hist, terminal_growth, wacc)
+                terminal_reinv = get_terminal_reinvestment_rate(terminal_hist, terminal_growth)
 
                 valuation = calculate_dcf_valuation(
                     projections, wacc, terminal_growth,
@@ -1988,7 +2001,17 @@ def render_dcf():
                 wacc_high = st.number_input("High WACC (%)", value=(wacc*100 + 1.5), step=0.25, key="wacc_high") / 100
 
                 sensitivity_results = []
+                sensitivity_terminal_reinv = get_terminal_reinvestment_rate(terminal_hist, terminal_growth)
                 for w in [wacc_low, wacc, wacc_high]:
+                    if not np.isfinite(w) or w <= 0 or terminal_growth >= w:
+                        sensitivity_results.append({
+                            'WACC': f"{w:.2%}",
+                            'Enterprise Value': "N/A",
+                            'Equity Value': "N/A",
+                            'Share Price': "N/A",
+                            'vs Current': "WACC must exceed growth",
+                        })
+                        continue
                     proj_copy = build_dcf_projections(
                         ltm_revenue, most_recent_date,
                         growth_rates, ebit_margins, reinv_rates, eff_tax_rate
@@ -1996,7 +2019,7 @@ def render_dcf():
                     val = calculate_dcf_valuation(
                         proj_copy, w, terminal_growth,
                         total_debt, total_cash, shares_outstanding,
-                        terminal_reinvestment_rate=get_terminal_reinvestment_rate(terminal_hist, terminal_growth, w)
+                        terminal_reinvestment_rate=sensitivity_terminal_reinv
                     )
                     sensitivity_results.append({
                         'WACC': f"{w:.2%}",

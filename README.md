@@ -33,6 +33,7 @@ Deploy your own instance via [Streamlit Cloud](https://share.streamlit.io)
 - Discounts all cash flows to present value
 - Computes implied share price vs current market price
 - Sensitivity analysis for different WACC scenarios
+- Uncapped long-term and annual revenue growth assumptions; the perpetual growth rate must remain below WACC for a finite terminal value
 
 ## Installation
 
@@ -62,7 +63,9 @@ streamlit run app.py
 | `k_E = r_f + β × EMRP` | Cost of Equity (CAPM) |
 | `k_D = r_f + spread` | Cost of Debt |
 | `FCF = NOPAT × (1 - Reinvestment Rate)` | Free Cash Flow |
-| `TV = FCF × (1 + g) / (WACC - g)` | Terminal Value (Gordon Growth) |
+| `TV = NOPAT_n × (1 + g) × (1 - g/ROC) / (WACC - g)` | Terminal Value (Gordon Growth), with terminal reinvestment implied by `g / ROC` |
+
+The DCF tab values free cash flow to the firm and is not directly comparable to a dividend discount model. Its long-term growth assumption applies perpetually after the explicit revenue-growth forecast; it is not a forecast-period growth rate. Growth inputs are not artificially capped, but a Gordon Growth terminal value is undefined when long-term growth is at or above WACC.
 
 ## Data Sources
 
