@@ -29,17 +29,18 @@ Deploy your own instance via [Streamlit Cloud](https://share.streamlit.io)
   - Revenue growth rates by year
   - EBIT margins by year
   - Reinvestment rates by year
+  - Two assumptions transition linearly from year 1 to the final forecast year
 - Terminal value via Gordon Growth Model
 - Discounts all cash flows to present value
 - Computes implied share price vs current market price
 - Sensitivity analysis for different WACC scenarios
-- Uncapped long-term and annual revenue growth assumptions; the perpetual growth rate must remain below WACC for a finite terminal value
+- Uncapped, editable annual and long-term growth assumptions; the recommended perpetual rate is bounded by the risk-free rate as a long-run nominal-growth ceiling, and must remain below WACC for a finite terminal value
 
 ## Installation
 
 ```bash
 # Clone the repository
-git clone https://github.com/jblocher/mgt6534-dcf-0945-2025.git
+git clone https://github.com/cadenypatel/mgt6534-dcf-0945-2025.git
 cd mgt6534-dcf-0945-2025
 
 # Install dependencies
@@ -65,7 +66,9 @@ streamlit run app.py
 | `FCF = NOPAT × (1 - Reinvestment Rate)` | Free Cash Flow |
 | `TV = NOPAT_n × (1 + g) × (1 - g/ROC) / (WACC - g)` | Terminal Value (Gordon Growth), with terminal reinvestment implied by `g / ROC` |
 
-The DCF tab values free cash flow to the firm and is not directly comparable to a dividend discount model. Its long-term growth assumption applies perpetually after the explicit revenue-growth forecast; it is not a forecast-period growth rate. Growth inputs are not artificially capped, but a Gordon Growth terminal value is undefined when long-term growth is at or above WACC.
+The DCF tab values free cash flow to the firm and is not directly comparable to a dividend discount model. Its long-term growth assumption applies perpetually after the explicit revenue-growth forecast; it is not a forecast-period growth rate. Historical reinvestment × return on capital is shown as a sustainable-growth diagnostic, not automatically treated as perpetual growth: unusually high company growth cannot be extrapolated forever. The recommended stable rate is limited by the risk-free rate (a nominal-growth ceiling), remains editable, and is checked against WACC, consistent with [Damodaran's stable-growth guidance](https://pages.stern.nyu.edu/~adamodar/pdfiles/valonlineslides/session9.pdf). A Gordon Growth terminal value is undefined when long-term growth is at or above WACC.
+
+Two projection assumptions define starting and ending values and transition linearly over the explicit forecast. A latest trailing-twelve-month statement is not treated as an annual growth observation when it overlaps the previous fiscal-year total. Historical return on capital uses average beginning- and ending-period invested capital rather than a single year-end balance-sheet snapshot. These outputs remain estimates based on reported historical statements and user-selected assumptions; they are not guaranteed fair values or investment advice.
 
 ## Data Sources
 

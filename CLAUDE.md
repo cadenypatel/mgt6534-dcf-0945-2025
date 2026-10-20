@@ -27,7 +27,7 @@ pip install -r requirements.txt
 
 ## Deployment
 
-- **GitHub Repository**: https://github.com/jblocher/mgt6534-dcf-0945-2025
+- **GitHub Repository**: https://github.com/cadenypatel/mgt6534-dcf-0945-2025
 - **Streamlit Cloud**: Deploy via https://share.streamlit.io (select repo, branch: main, file: app.py)
 
 ## App Structure
@@ -114,7 +114,7 @@ The original Colab notebooks are preserved as reference:
   - Implied share price vs current market price
   - Sensitivity analysis for WACC scenarios
   - Full valuation summary table
-- Pushed code to GitHub: jblocher/mgt6534-dcf-0945-2025
+- Pushed code to GitHub: cadenypatel/mgt6534-dcf-0945-2025
 - Prepared for Streamlit Cloud deployment
 
 ### 2026 Valuation Update
