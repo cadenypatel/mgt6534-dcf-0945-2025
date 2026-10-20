@@ -86,6 +86,10 @@ CREDIT_SPREADS = [
 # updated January 2025). Used as the default EMRP; still editable in the UI.
 DEFAULT_EMRP = 0.0433
 
+# US marginal corporate rate (21% federal + ~4% state, Damodaran's US default),
+# used for the WACC debt tax shield.
+MARGINAL_TAX_RATE = 0.25
+
 # ============================================================================
 # Helper Functions
 # ============================================================================
@@ -121,7 +125,8 @@ def get_interest_coverage_ratio(ticker_symbol):
         latest = income_stmt.sort_index(axis=1, ascending=False).iloc[:, 0]
 
         ebit = None
-        for label in ("EBIT", "Operating Income"):
+        # Prefer Operating Income: Yahoo's "EBIT" adds back non-operating gains.
+        for label in ("Operating Income", "EBIT"):
             if label in latest.index and pd.notna(latest[label]):
                 ebit = float(latest[label])
                 break
@@ -435,12 +440,63 @@ def get_company_market_data(ticker_symbol):
             "Try again in a moment or check the ticker symbol."
         )
 
+    # Dilution from options/RSUs/convertibles: the latest quarter's gap between
+    # diluted and basic average shares, added to the current basic count.
+    dilutive_shares = 0.0
+    try:
+        quarterly_income = ticker.quarterly_income_stmt
+        if quarterly_income is not None and not quarterly_income.empty:
+            latest_quarter = quarterly_income.T.sort_index()
+            diluted = _statement_series(latest_quarter, ["Diluted Average Shares"]).dropna()
+            basic = _statement_series(latest_quarter, ["Basic Average Shares"]).dropna()
+            common_dates = diluted.index.intersection(basic.index)
+            if not common_dates.empty:
+                latest_date = common_dates.max()
+                dilutive_shares = max(float(diluted[latest_date] - basic[latest_date]), 0.0)
+    except Exception:
+        dilutive_shares = 0.0
+
+    # Long-term investments (marketable securities, equity-method stakes) are
+    # non-operating assets whose income isn't in operating income.
+    non_operating_assets = 0.0
+    minority_interest = 0.0
+    if not balance_sheet.empty:
+        non_operating_assets = _latest_statement_value(balance_sheet, ["Investments And Advances"]) or 0.0
+        minority_interest = _latest_statement_value(balance_sheet, ["Minority Interest"]) or 0.0
+
+    # Foreign filers/ADRs (e.g., TSM, NVO) report statements in their home
+    # currency while the share price is quoted in another; statement amounts
+    # must be converted before they're compared with price or market cap.
+    price_currency = (ticker_info.get("currency") or "USD").upper()
+    financial_currency = (ticker_info.get("financialCurrency") or price_currency).upper()
+    fx_rate = 1.0
+    if financial_currency != price_currency:
+        try:
+            fx_history = yf.Ticker(f"{financial_currency}{price_currency}=X").history(
+                period="5d", auto_adjust=False
+            )["Close"].dropna()
+            fx_rate = _positive_number(fx_history.iloc[-1]) if not fx_history.empty else None
+        except Exception:
+            fx_rate = None
+        if fx_rate is None:
+            raise ValueError(
+                f"{ticker_symbol} reports in {financial_currency} but trades in {price_currency}, "
+                "and no exchange rate was available to convert between them."
+            )
+
     return {
         "company_name": ticker_info.get("longName", ticker_symbol),
+        "price_currency": price_currency,
+        "financial_currency": financial_currency,
+        "fx_rate": fx_rate,
         "market_cap": market_cap,
         "shares_outstanding": shares_outstanding,
+        "basic_shares_outstanding": shares_outstanding,
+        "diluted_shares_outstanding": shares_outstanding + dilutive_shares,
         "total_debt": total_debt if total_debt is not None else 0,
         "total_cash": total_cash if total_cash is not None else 0,
+        "non_operating_assets": non_operating_assets,
+        "minority_interest": minority_interest,
         "current_price": current_price,
     }
 
@@ -467,7 +523,7 @@ def get_wacc_input_defaults(ticker_symbol):
     return (
         risk_free_rate,
         equity_market_risk_premium,
-        get_effective_tax_rate(ticker_symbol),
+        MARGINAL_TAX_RATE,
         credit_rating_default,
         interest_coverage_ratio,
     )
@@ -780,7 +836,12 @@ def _augment_with_latest_quarterly(ticker_symbol, income_statement, balance_shee
 
             # Income statement flow items (sum trailing 4 quarters)
             income_statement.loc[latest_q, 'Total Revenue'] = _statement_series(tail_qi, ['Total Revenue', 'Operating Revenue']).sum()
-            income_statement.loc[latest_q, 'EBIT'] = _statement_series(tail_qi, ['EBIT', 'Operating Income']).sum()
+            # Yahoo's quarterly "EBIT" includes non-operating income (investment
+            # gains, equity-method income); operating income is the FCFF driver.
+            ltm_operating_income = _statement_series(tail_qi, ['Operating Income', 'EBIT']).sum()
+            income_statement.loc[latest_q, 'EBIT'] = ltm_operating_income
+            if 'Operating Income' in income_statement.columns:
+                income_statement.loc[latest_q, 'Operating Income'] = ltm_operating_income
             income_statement.loc[latest_q, 'Gross Profit'] = _statement_series(tail_qi, ['Gross Profit']).sum()
             income_statement.loc[latest_q, 'Cost Of Revenue'] = _statement_series(tail_qi, ['Cost Of Revenue']).sum()
             income_statement.loc[latest_q, 'Tax Provision'] = _statement_series(tail_qi, ['Tax Provision']).sum()
@@ -910,7 +971,16 @@ def get_historical_data(ticker_symbol):
             pass
 
     historical_periods = available_target_periods
-    historical_periods = historical_periods[~historical_periods.year.duplicated(keep='last')]
+    # Drop only near-duplicate period ends (e.g., 52/53-week calendars), not a
+    # whole fiscal year that shares a calendar year with the LTM point:
+    # January fiscal-year filers (NVDA, WMT) used to lose their latest 10-K.
+    kept_periods = []
+    for period in historical_periods.sort_values():
+        if kept_periods and (period - kept_periods[-1]).days < 45:
+            kept_periods[-1] = period
+        else:
+            kept_periods.append(period)
+    historical_periods = pd.DatetimeIndex(kept_periods)
     if len(historical_periods) < 2:
         historical_periods = revenue_for_window.index[-5:]
     if len(historical_periods) < 2:
@@ -922,8 +992,12 @@ def get_historical_data(ticker_symbol):
     def _comparable_period_pct_change(series):
         # A single latest LTM point cannot be compared with the preceding
         # fiscal-year total as a growth rate; the periods overlap.
+        # A gap longer than a year (a missing fiscal year) is annualized so it
+        # isn't averaged in as if it were one year of growth.
         gap_years = pd.Series(series.index, index=series.index).diff().dt.days / 365.25
         growth = series.pct_change()
+        long = gap_years.notna() & (gap_years > 1.1) & (growth > -1)
+        growth = growth.where(~long, (1 + growth) ** (1 / gap_years) - 1)
         short = gap_years.notna() & (gap_years < 0.9)
         return growth.where(~short)
 
@@ -931,7 +1005,7 @@ def get_historical_data(ticker_symbol):
     revenue_growth_change = revenue_growth.diff()
     ebit_for_growth = _statement_series(
         income_statement,
-        ['EBIT', 'Operating Income'],
+        ['Operating Income', 'EBIT'],
     ).dropna().sort_index().reindex(balance_periods)
     ebit_growth = _comparable_period_pct_change(ebit_for_growth).reindex(historical_periods).replace([np.inf, -np.inf], np.nan)
 
@@ -945,9 +1019,11 @@ def get_historical_data(ticker_symbol):
         income_statement, ['Total Revenue', 'Operating Revenue']
     )
     income_statement['EBIT'] = _statement_series(
-        income_statement, ['EBIT', 'Operating Income']
+        income_statement, ['Operating Income', 'EBIT']
     )
     if income_statement['EBIT'].isna().all():
+        # Pre-interest income is the closest proxy for operating income; net
+        # income (after interest and tax) is a last resort.
         net_income = _statement_series(
             income_statement,
             ['Net Income', 'Net Income Common Stockholders'],
@@ -957,12 +1033,12 @@ def get_historical_data(ticker_symbol):
             income_statement,
             ['Interest Expense', 'Interest Expense Non Operating'],
         )
-        if net_income.notna().any():
-            income_statement['EBIT'] = net_income
-        elif pretax_income.notna().any() and interest_expense.notna().any():
-            income_statement['EBIT'] = pretax_income + interest_expense
-        else:
+        if pretax_income.notna().any() and interest_expense.notna().any():
+            income_statement['EBIT'] = pretax_income + interest_expense.abs().fillna(0)
+        elif pretax_income.notna().any():
             income_statement['EBIT'] = pretax_income
+        else:
+            income_statement['EBIT'] = net_income
     gross_profit = _statement_series(income_statement, ['Gross Profit'])
     if gross_profit.isna().all():
         cost_of_revenue = _statement_series(income_statement, ['Cost Of Revenue'])
@@ -996,7 +1072,9 @@ def get_historical_data(ticker_symbol):
             )
         else:
             eff_tax_rate = pd.Series([0.21] * len(income_statement), index=income_statement.index)
-    eff_tax_rate = eff_tax_rate.replace([np.inf, -np.inf], np.nan).fillna(0.21)
+    # Clip so a near-zero pretax year can't produce a nonsensical rate that
+    # distorts NOPAT, return on capital, and reinvestment for that year.
+    eff_tax_rate = eff_tax_rate.replace([np.inf, -np.inf], np.nan).fillna(0.21).clip(0, 0.5)
 
     # Calculate NWC from balance sheet
     cash_col = 'Cash Cash Equivalents And Short Term Investments' if 'Cash Cash Equivalents And Short Term Investments' in balance_sheet.columns else 'Cash And Cash Equivalents'
@@ -1067,6 +1145,11 @@ def get_historical_data(ticker_symbol):
     df_stats['Return on Capital'] = (
         income_statement['NOPAT'] / average_invested_capital.reindex(income_statement.index)
     ).replace([np.inf, -np.inf], np.nan)
+    # Revenue generated per dollar of invested capital; links projected
+    # growth to the reinvestment needed to fund it.
+    df_stats['Sales to Capital'] = (
+        income_statement['Total Revenue'] / average_invested_capital.reindex(income_statement.index)
+    ).replace([np.inf, -np.inf], np.nan)
 
     return {
         'income_statement': income_statement,
@@ -1078,7 +1161,12 @@ def get_historical_data(ticker_symbol):
 
 
 def calculate_terminal_growth_rate(historical_data, risk_free_rate):
-    """Estimate stable growth, using the risk-free rate as a nominal-economy ceiling."""
+    """Recommend stable growth equal to the risk-free rate (Damodaran's default:
+    a firm can't outgrow the nominal economy forever, and the risk-free rate is
+    the market's proxy for nominal growth). Historical sustainable growth is
+    still computed and returned for display, but it is not used for the
+    perpetuity: it comes from noisy reinvestment history and can even be negative.
+    """
     if not np.isfinite(risk_free_rate):
         raise ValueError("Risk-free rate must be finite to estimate stable growth.")
 
@@ -1096,16 +1184,16 @@ def calculate_terminal_growth_rate(historical_data, risk_free_rate):
         and np.isfinite(average_reinvestment)
     ):
         historical_growth = average_reinvestment * average_return_on_capital
-        method = 'Historical reinvestment rate × return on capital, subject to the risk-free-rate ceiling'
     else:
         historical_growth = _average_revenue_growth(stats['Revenue Growth'].dropna())
-        method = 'Historical revenue growth, subject to the risk-free-rate ceiling'
 
     if not np.isfinite(historical_growth):
-        historical_growth = risk_free_rate
-        method = 'Risk-free-rate proxy (insufficient usable historical growth data)'
-
-    terminal_growth = min(float(historical_growth), float(risk_free_rate))
+        historical_growth = np.nan
+    method = (
+        'Stable growth is set to the risk-free rate, the proxy for long-run nominal economic growth; '
+        'historical sustainable growth is shown for reference only'
+    )
+    terminal_growth = max(float(risk_free_rate), 0.0)
     return (
         terminal_growth,
         average_reinvestment,
@@ -1115,8 +1203,47 @@ def calculate_terminal_growth_rate(historical_data, risk_free_rate):
     )
 
 
-def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045):
-    """Return historical-average projection assumptions from saved analysis data."""
+def get_forward_revenue_growth(ticker_symbol, ltm_revenue, ltm_date):
+    """Next-twelve-months revenue growth implied by analyst consensus.
+
+    Consensus is given per fiscal year (current "0y" and next "+1y"); the NTM
+    window after the LTM date overlaps both, so blend them by how much of the
+    current fiscal year is still ahead. Returns None when estimates are missing.
+    """
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        estimates = ticker.revenue_estimate
+        averages = pd.to_numeric(estimates["avg"], errors="coerce")
+        current_fy = _positive_number(averages.get("0y"))
+        next_fy = _positive_number(averages.get("+1y"))
+        if current_fy is None or next_fy is None or not ltm_revenue or ltm_revenue <= 0:
+            return None
+
+        remaining = 0.5
+        last_fy_end = ticker.info.get("lastFiscalYearEnd")
+        if last_fy_end:
+            fy_end = pd.Timestamp(last_fy_end, unit="s")
+            ltm_date = pd.Timestamp(ltm_date).tz_localize(None)
+            while fy_end <= ltm_date:
+                fy_end += pd.DateOffset(years=1)
+            remaining = float(np.clip((fy_end - ltm_date).days / 365.25, 0.0, 1.0))
+
+        ntm_revenue = remaining * current_fy + (1 - remaining) * next_fy
+        growth = ntm_revenue / ltm_revenue - 1
+        return float(growth) if np.isfinite(growth) else None
+    except Exception:
+        return None
+
+
+def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, forward_growth=None):
+    """Return projection assumptions from saved analysis data.
+
+    Revenue growth starts at the consensus NTM growth (or the latest actual
+    year) and converges to stable growth (the risk-free rate) by the final
+    year. Reinvestment is derived from growth through the historical
+    sales-to-capital ratio; a historical reinvestment rate is kept only as the
+    manual fallback.
+    """
     fallback_values = {
         'Revenue Growth': 0.10,
         'EBIT Margin': 0.30,
@@ -1124,37 +1251,23 @@ def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045):
     }
     stats = historical_data['df_stats'].replace([np.inf, -np.inf], np.nan)
     income_statement = historical_data.get('income_statement', pd.DataFrame())
+    stable_growth = max(float(risk_free_rate), 0.0)
 
     defaults = {}
     fallback_columns = []
     for column, fallback in fallback_values.items():
         values = stats[column].dropna()
-        if values.empty:
+        if column == 'Revenue Growth' and forward_growth is not None:
+            defaults[column] = (float(forward_growth), stable_growth)
+            defaults['_growth_source'] = 'analyst consensus (next twelve months)'
+        elif values.empty:
             defaults[column] = fallback
             fallback_columns.append(column)
         elif column == 'Reinv Rate':
-            historical_reinvestment = pd.to_numeric(values, errors='coerce').dropna()
-            recent_reinvestment = float(historical_reinvestment.iloc[-1])
-            stable_growth, _, return_on_capital, _, _ = calculate_terminal_growth_rate(
-                historical_data, risk_free_rate
-            )
-            stable_reinvestment = (
-                stable_growth / return_on_capital
-                if np.isfinite(return_on_capital) and return_on_capital > 0
-                else _average_historical_reinvestment_rate(stats, fallback)
-            )
-            defaults[column] = (
-                (recent_reinvestment, float(stable_reinvestment))
-                if abs(recent_reinvestment - stable_reinvestment) > 0.02
-                else float(stable_reinvestment)
-            )
+            defaults[column] = _average_historical_reinvestment_rate(stats, fallback)
         elif column == 'Revenue Growth':
-            hist_avg = _average_revenue_growth(values)
-            recent_val = float(values.iloc[-1])
-            if len(values) >= 2 and np.isfinite(hist_avg) and abs(recent_val - hist_avg) > 0.02:
-                defaults[column] = (recent_val, hist_avg)
-            else:
-                defaults[column] = recent_val
+            defaults[column] = (float(values.iloc[-1]), stable_growth)
+            defaults['_growth_source'] = f"latest reported year ({values.index[-1]:%b %Y})"
         else:
             hist_avg = _average_dampening_giant_outliers_only(values)
             recent_val = float(values.iloc[-1])
@@ -1173,6 +1286,13 @@ def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045):
         and ebit_series.dropna().size > 0
         and ebit_series.dropna().max() <= 0
     )
+    sales_to_capital = _recency_weighted_average(
+        stats['Sales to Capital'][stats['Sales to Capital'] > 0]
+    ) if 'Sales to Capital' in stats else np.nan
+    defaults['Sales to Capital'] = float(sales_to_capital) if np.isfinite(sales_to_capital) else None
+    return_on_capital = _recency_weighted_average(stats['Return on Capital'].dropna())
+    defaults['Historical ROC'] = float(return_on_capital) if np.isfinite(return_on_capital) else None
+
     if no_positive_operations:
         defaults['Revenue Growth'] = 0.0
         defaults['EBIT Margin'] = 0.0
@@ -1184,15 +1304,35 @@ def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045):
     return defaults
 
 
-def get_projection_defaults(ticker_symbol, risk_free_rate=0.045):
-    """Fetch and return historical-average projection assumptions for a ticker."""
+def get_projection_defaults(ticker_symbol, risk_free_rate=0.045, forward_growth=None):
+    """Fetch and return projection assumptions for a ticker."""
     return get_projection_defaults_from_data(
-        get_historical_data(ticker_symbol), risk_free_rate
+        get_historical_data(ticker_symbol), risk_free_rate, forward_growth
     )
 
 
-def expand_projection_input(raw_value, label, horizon=None):
-    """Repeat one input or linearly transition two assumptions across a horizon."""
+# Share of a year's excess growth (above stable growth) that persists into the
+# next year. Revenue growth mean-reverts fast (Chan, Karceski & Lakonishok
+# 2003; McKinsey, "Valuation"): 0.75 is a half-life of about 2.4 years.
+GROWTH_PERSISTENCE = 0.75
+
+
+def _converging_path(start, end, horizon, persistence=GROWTH_PERSISTENCE):
+    """Path from `start` (year 1) to `end` (final year) where the gap shrinks
+    geometrically, front-loading the decline as growth rates empirically do."""
+    if horizon == 1:
+        return [start]
+    floor = persistence ** (horizon - 1)
+    weights = [(persistence ** t - floor) / (1 - floor) for t in range(horizon)]
+    return [end + (start - end) * w for w in weights]
+
+
+def expand_projection_input(raw_value, label, horizon=None, converge=False):
+    """Repeat one input or transition two assumptions across a horizon.
+
+    Two values move linearly from the first to the final year, or, with
+    `converge`, along a front-loaded geometric fade (used for revenue growth).
+    """
     try:
         values = [float(value.strip()) / 100 for value in raw_value.split(',') if value.strip()]
     except ValueError as error:
@@ -1207,6 +1347,8 @@ def expand_projection_input(raw_value, label, horizon=None):
     if len(values) == 1:
         return values * horizon
     if len(values) == 2 and horizon > 2:
+        if converge:
+            return _converging_path(values[0], values[1], horizon)
         return np.linspace(values[0], values[1], horizon).tolist()
     if len(values) == horizon:
         return values
@@ -1268,8 +1410,14 @@ def get_ltm_revenue(ticker_symbol):
     return ltm_revenue, most_recent_date
 
 
-def build_dcf_projections(ltm_revenue, most_recent_date, growth_rates, ebit_margins, reinv_rates, eff_tax_rate):
-    """Build projections dataframe for DCF model."""
+def build_dcf_projections(ltm_revenue, most_recent_date, growth_rates, ebit_margins, reinv_rates, eff_tax_rate,
+                          sales_to_capital=None):
+    """Build projections dataframe for DCF model.
+
+    With `sales_to_capital`, reinvestment is derived from growth (change in
+    revenue / sales-to-capital) so growth is never assumed without the capital
+    to fund it; `reinv_rates` is then ignored.
+    """
     time_horizon = len(growth_rates)
     if time_horizon == 0:
         raise ValueError("At least one projection year is required.")
@@ -1303,7 +1451,18 @@ def build_dcf_projections(ltm_revenue, most_recent_date, growth_rates, ebit_marg
     projections['Revenue'] = projected_revenue
     projections['EBIT'] = projections['Revenue'] * projections['EBIT Margin']
     projections['NOPAT'] = projections['EBIT'] * (1 - eff_tax_rate)
-    projections['FCF'] = projections['NOPAT'] * (1 - projections['Reinv Rate'])
+    if sales_to_capital is not None:
+        if not np.isfinite(sales_to_capital) or sales_to_capital <= 0:
+            raise ValueError("Sales-to-capital ratio must be greater than zero.")
+        revenue_change = projections['Revenue'].diff()
+        revenue_change.iloc[0] = projections['Revenue'].iloc[0] - ltm_revenue
+        projections['Reinvestment'] = revenue_change / sales_to_capital
+        projections['Reinv Rate'] = (
+            projections['Reinvestment'] / projections['NOPAT'].where(projections['NOPAT'] > 0)
+        )
+    else:
+        projections['Reinvestment'] = projections['NOPAT'] * projections['Reinv Rate']
+    projections['FCF'] = projections['NOPAT'] - projections['Reinvestment']
     projections['T'] = range(1, time_horizon + 1)
 
     if not np.isfinite(projections[['Revenue', 'EBIT', 'NOPAT', 'FCF']].to_numpy()).all():
@@ -1312,22 +1471,48 @@ def build_dcf_projections(ltm_revenue, most_recent_date, growth_rates, ebit_marg
     return projections
 
 
-def get_terminal_reinvestment_rate(historical_data, terminal_growth):
-    """Terminal reinvestment rate = g / ROC, so terminal FCF matches the terminal growth assumed."""
-    stats = historical_data['df_stats'].replace([np.inf, -np.inf], np.nan)
-    roc = _recency_weighted_average(stats['Return on Capital'].dropna())
-    if not np.isfinite(roc) or roc <= 0:
-        if terminal_growth == 0:
-            return 0.0
-        raise ValueError(
-            "A positive historical return on capital is required to estimate terminal reinvestment."
-        )
-    return float(terminal_growth / roc)
+RONIC_MODES = {
+    "Halfway between historical ROC and WACC": "midpoint",
+    "Equal to WACC (no excess returns)": "wacc",
+    "Historical return on capital (durable moat)": "historical",
+    "Custom": "custom",
+}
+
+
+def resolve_terminal_ronic(mode, wacc, historical_roc, custom_value=None):
+    """Terminal return on new invested capital for a RONIC_MODES choice.
+    Modes that need history fall back to WACC when it isn't usable."""
+    usable_roc = historical_roc if historical_roc is not None and np.isfinite(historical_roc) and historical_roc > 0 else None
+    if mode == "custom" and custom_value:
+        return float(custom_value)
+    if mode == "historical" and usable_roc is not None:
+        return float(usable_roc)
+    if mode == "midpoint" and usable_roc is not None:
+        return float((usable_roc + wacc) / 2)
+    return float(wacc)
+
+
+def get_terminal_reinvestment_rate(terminal_growth, return_on_new_capital):
+    """Terminal reinvestment rate = g / RONIC (McKinsey value-driver formula),
+    so perpetual growth is funded at the assumed return on new capital."""
+    if terminal_growth == 0:
+        return 0.0
+    if not np.isfinite(return_on_new_capital) or return_on_new_capital <= 0:
+        raise ValueError("Terminal return on new capital must be greater than zero.")
+    return float(terminal_growth / return_on_new_capital)
 
 
 def calculate_dcf_valuation(projections, wacc, terminal_growth, total_debt, total_cash, shares_outstanding,
-                            terminal_reinvestment_rate=None):
-    """Calculate DCF valuation and implied share price."""
+                            terminal_reinvestment_rate=None, mid_year=True,
+                            non_operating_assets=0.0, minority_interest=0.0, fx_rate=1.0):
+    """Calculate DCF valuation and implied share price.
+
+    `mid_year` discounts each year's FCF from mid-year, since cash arrives
+    through the year rather than on its last day; the perpetuity is shifted by
+    the same half year so it stays consistent with the explicit forecast.
+    Amounts are in the statement currency; `fx_rate` converts equity value to
+    the quote currency for the per-share price.
+    """
     time_horizon = len(projections)
 
     if not np.isfinite(wacc) or wacc <= 0:
@@ -1338,7 +1523,8 @@ def calculate_dcf_valuation(projections, wacc, terminal_growth, total_debt, tota
         raise ValueError("Shares outstanding must be greater than zero.")
 
     # Discount FCF to present
-    projections['Discounted_FCF'] = projections['FCF'] / (1 + wacc) ** projections['T']
+    timing_shift = 0.5 if mid_year else 0.0
+    projections['Discounted_FCF'] = projections['FCF'] / (1 + wacc) ** (projections['T'] - timing_shift)
     pv_fcf = projections['Discounted_FCF'].sum()
 
     # Terminal value using Gordon Growth Model
@@ -1348,12 +1534,14 @@ def calculate_dcf_valuation(projections, wacc, terminal_growth, total_debt, tota
         raise ValueError("Terminal reinvestment rate must be finite.")
     terminal_fcf = projections.iloc[-1]['NOPAT'] * (1 + terminal_growth) * (1 - terminal_reinvestment_rate)
     terminal_value = terminal_fcf / (wacc - terminal_growth)
-    pv_terminal = terminal_value / (1 + wacc) ** time_horizon
+    pv_terminal = terminal_value / (1 + wacc) ** (time_horizon - timing_shift)
 
-    # Enterprise value and equity value
+    # Enterprise value and equity value. Non-operating investments are added
+    # because their income is excluded from operating income; minority
+    # interest is the outside owners' share of consolidated cash flows.
     enterprise_value = pv_fcf + pv_terminal
-    equity_value = enterprise_value - total_debt + total_cash
-    share_price = equity_value / shares_outstanding
+    equity_value = enterprise_value - total_debt + total_cash + non_operating_assets - minority_interest
+    share_price = equity_value * fx_rate / shares_outstanding
 
     return {
         'pv_fcf': pv_fcf,
@@ -1418,10 +1606,10 @@ def render_home():
 
     with col2:
         st.markdown("**Free Cash Flow**")
-        st.latex(r"FCF = NOPAT \times (1 - ReinvestmentRate)")
+        st.latex(r"FCF = NOPAT - \frac{\Delta Revenue}{Sales/Capital}")
 
         st.markdown("**Terminal Value**")
-        st.latex(r"TV = \frac{NOPAT_{final} \times (1 + g) \times (1 - g/ROC)}{WACC - g}")
+        st.latex(r"TV = \frac{NOPAT_{final} \times (1 + g) \times (1 - g/RONIC)}{WACC - g}")
 
     st.markdown("<div style='height: .5rem'></div>", unsafe_allow_html=True)
     st.caption("Built for MGT6534 | Market and financial statement data from Yahoo Finance")
@@ -1478,7 +1666,8 @@ def render_wacc():
         marg_tax_rate = st.number_input(
             "Marginal Tax Rate (%)",
             min_value=0.0, max_value=50.0, step=1.0, key="wacc_tax_rate",
-            help="Auto-populated from the ticker's latest usable tax rate"
+            help="Interest is deducted at the marginal rate, so the debt tax shield uses it "
+                 "(US default: 21% federal + ~4% state = 25%) rather than the effective rate"
         ) / 100
 
     st.caption("Risk-free rate, tax rate, and credit rating refresh when the ticker changes. EMRP is a market-wide assumption sourced from Damodaran and remains editable.")
@@ -1491,7 +1680,9 @@ def render_wacc():
                 company_data = get_company_market_data(ticker_symbol)
                 company_name = company_data["company_name"]
                 market_cap = company_data["market_cap"]
-                total_debt = company_data["total_debt"]
+                # Debt is reported in the statement currency; market cap is in the
+                # quote currency.
+                total_debt = company_data["total_debt"] * company_data["fx_rate"]
 
                 st.subheader(f"{company_name} ({ticker_symbol})")
 
@@ -1593,13 +1784,13 @@ def render_wacc():
                         )
                         st.metric("Normalized Return on Capital", roc_display)
                     with growth_col3:
-                        st.metric("Historical Sustainable Growth", f"{historical_growth:.2%}")
+                        st.metric(
+                            "Historical Sustainable Growth",
+                            f"{historical_growth:.2%}" if np.isfinite(historical_growth) else "N/A",
+                        )
                     with growth_col4:
                         st.metric("Recommended Stable Growth", f"{terminal_growth:.2%}")
-                    st.caption(
-                        f"{growth_method}. Historical sustainable growth is not automatically a perpetual growth rate. "
-                        "The recommendation uses the risk-free rate as a ceiling for long-run nominal economic growth."
-                    )
+                    st.caption(f"{growth_method}.")
                     if terminal_growth >= wacc:
                         st.warning(
                             f"The recommended stable growth ({terminal_growth:.2%}) is not below WACC ({wacc:.2%}). "
@@ -1818,12 +2009,19 @@ def render_dcf():
             saved_historical_data = st.session_state.get("historical_analysis_data")
             saved_historical_ticker = st.session_state.get("historical_analysis_ticker")
             try:
+                ltm_for_growth, ltm_date_for_growth = get_ltm_revenue(ticker_symbol)
+                forward_growth = get_forward_revenue_growth(
+                    ticker_symbol, ltm_for_growth, ltm_date_for_growth
+                )
+            except Exception:
+                forward_growth = None
+            try:
                 if saved_historical_ticker == ticker_symbol and saved_historical_data is not None:
                     projection_defaults = get_projection_defaults_from_data(
-                        saved_historical_data, risk_free_rate
+                        saved_historical_data, risk_free_rate, forward_growth
                     )
                 else:
-                    projection_defaults = get_projection_defaults(ticker_symbol, risk_free_rate)
+                    projection_defaults = get_projection_defaults(ticker_symbol, risk_free_rate, forward_growth)
             except Exception as error:
                 st.error(
                     f"Could not load historical projection assumptions for {ticker_symbol}: {error}"
@@ -1846,11 +2044,24 @@ def render_dcf():
                     st.session_state[key] = f"{val[0] * 100:.2f}, {val[1] * 100:.2f}"
                 else:
                     st.session_state[key] = f"{val * 100:.2f}"
+            st.session_state["dcf_growth_source"] = projection_defaults.get('_growth_source', 'placeholder')
+
+            sales_to_capital_default = projection_defaults.get('Sales to Capital')
+            st.session_state["dcf_link_reinvestment"] = sales_to_capital_default is not None
+            st.session_state["dcf_sales_to_capital"] = round(sales_to_capital_default or 1.0, 2)
+            st.session_state["dcf_ronic_mode"] = next(iter(RONIC_MODES))
+            historical_roc = projection_defaults.get('Historical ROC')
+            st.session_state["dcf_terminal_ronic"] = round(
+                historical_roc * 100 if historical_roc and historical_roc > 0 else 10.0, 2
+            )
+            st.session_state["dcf_historical_roc"] = historical_roc
 
             if st.session_state.get("wacc_calculated_ticker") == ticker_symbol:
                 st.session_state["dcf_wacc_rate"] = st.session_state["wacc_calculated_rate"] * 100
             if st.session_state.get("wacc_terminal_growth_ticker") == ticker_symbol:
                 st.session_state["dcf_terminal_growth_rate"] = st.session_state["wacc_terminal_growth_rate"] * 100
+            else:
+                st.session_state["dcf_terminal_growth_rate"] = max(risk_free_rate, 0.0) * 100
         st.session_state["dcf_tax_ticker"] = ticker_symbol
         st.session_state["dcf_projection_refresh_needed"] = False
 
@@ -1903,9 +2114,13 @@ def render_dcf():
         help="Fixed horizons repeat one assumption. Custom mode uses one value per comma-separated year.",
     )
     st.caption(
-        "Auto-filled from historical data when available. One value holds constant; "
-        "two values transition linearly from year 1 to the final forecast year; "
+        "Auto-filled when available. One value holds constant; two values transition from year 1 to the "
+        "final forecast year (revenue growth fades front-loaded, margins and reinvestment linearly); "
         "Custom mode accepts one assumption per year."
+    )
+    st.caption(
+        f"Year-1 revenue growth source: {st.session_state.get('dcf_growth_source', 'placeholder')}. "
+        "It converges to the long-term growth rate by the final year."
     )
 
     col_a, col_b, col_c = st.columns(3)
@@ -1914,7 +2129,8 @@ def render_dcf():
         growth_input = st.text_input(
             "Revenue Growth Rates (%)",
             key="dcf_growth_input",
-            help="One value repeats; two values linearly transition from the first to final forecast year"
+            help="Two values: year-1 growth, then final-year growth. The gap closes ~25% per year "
+                 "(empirical mean reversion of growth), so it reaches the final value in the last year."
         )
 
     with col_b:
@@ -1924,11 +2140,58 @@ def render_dcf():
             help="One value repeats; two values linearly transition from the first to final forecast year"
         )
 
+    col_d, col_e = st.columns(2)
+    with col_d:
+        link_reinvestment = st.checkbox(
+            "Derive reinvestment from growth (sales-to-capital)",
+            key="dcf_link_reinvestment",
+            help="Reinvestment = change in revenue / sales-to-capital, so growth is always funded. "
+                 "Turn off to enter reinvestment rates manually.",
+        )
+        sales_to_capital = st.number_input(
+            "Sales-to-Capital Ratio",
+            min_value=0.05, max_value=50.0, step=0.1, key="dcf_sales_to_capital",
+            disabled=not link_reinvestment,
+            help="Revenue per dollar of invested capital (debt + equity - cash), recency-weighted from history.",
+        )
+
     with col_c:
         reinv_input = st.text_input(
             "Reinvestment Rates (%)",
             key="dcf_reinvestment_input",
-            help="One value repeats; two values linearly transition from the first to final forecast year"
+            disabled=link_reinvestment,
+            help="Used only when reinvestment is not derived from growth. "
+                 "One value repeats; two values linearly transition from the first to final forecast year"
+        )
+
+    historical_roc = st.session_state.get("dcf_historical_roc")
+    with col_e:
+        ronic_mode = st.selectbox(
+            "Terminal Return on New Capital",
+            options=list(RONIC_MODES),
+            key="dcf_ronic_mode",
+            help="Return earned on capital invested after the forecast; sets terminal reinvestment = g / RONIC. "
+                 "Excess returns usually fade but persist for strong franchises (McKinsey ROIC-persistence data), "
+                 "so the default meets halfway between today's return and WACC.",
+        )
+        terminal_ronic_input = st.number_input(
+            "Custom Terminal Return on New Capital (%)",
+            min_value=0.5, max_value=200.0, step=0.5, key="dcf_terminal_ronic",
+            disabled=RONIC_MODES[ronic_mode] != "custom",
+        ) / 100
+        mid_year = st.checkbox(
+            "Mid-year discounting", key="dcf_mid_year", value=True,
+            help="Cash flows arrive through the year, so discount them from mid-year (standard convention).",
+        )
+
+    def terminal_ronic_for(discount_rate):
+        return resolve_terminal_ronic(RONIC_MODES[ronic_mode], discount_rate, historical_roc, terminal_ronic_input)
+
+    terminal_ronic = terminal_ronic_for(wacc)
+    if historical_roc:
+        st.caption(
+            f"Historical return on capital (recency-weighted): {historical_roc:.1%}. "
+            f"Terminal return on new capital used: {terminal_ronic:.1%}."
         )
 
     # Parse inputs
@@ -1936,14 +2199,17 @@ def render_dcf():
         if horizon_mode == "Custom comma-separated":
             growth_rates = expand_projection_input(growth_input, "Revenue growth rates")
             ebit_margins = expand_projection_input(margin_input, "EBIT margins")
-            reinv_rates = expand_projection_input(reinv_input, "Reinvestment rates")
+            reinv_rates = (
+                [0.0] * len(growth_rates) if link_reinvestment
+                else expand_projection_input(reinv_input, "Reinvestment rates")
+            )
             if not (len(growth_rates) == len(ebit_margins) == len(reinv_rates)):
                 st.error("Custom projection inputs must contain the same number of yearly values.")
                 return
             time_horizon = len(growth_rates)
         else:
             time_horizon = int(horizon_mode.split()[0])
-            growth_rates = expand_projection_input(growth_input, "Revenue growth rates", time_horizon)
+            growth_rates = expand_projection_input(growth_input, "Revenue growth rates", time_horizon, converge=True)
             ebit_margins = expand_projection_input(margin_input, "EBIT margins", time_horizon)
             reinv_rates = expand_projection_input(reinv_input, "Reinvestment rates", time_horizon)
 
@@ -1964,15 +2230,25 @@ def render_dcf():
                 # Get company data
                 company_data = get_company_market_data(ticker_symbol)
                 company_name = company_data["company_name"]
-                shares_outstanding = company_data["shares_outstanding"]
+                shares_outstanding = company_data["diluted_shares_outstanding"]
                 total_debt = company_data["total_debt"]
                 total_cash = company_data["total_cash"]
+                non_operating_assets = company_data["non_operating_assets"]
+                minority_interest = company_data["minority_interest"]
                 current_price = company_data["current_price"]
+                fx_rate = company_data["fx_rate"]
+                projection_s2c = sales_to_capital if link_reinvestment else None
 
                 # Get LTM Revenue
                 ltm_revenue, most_recent_date = get_ltm_revenue(ticker_symbol)
 
                 st.subheader(f"{company_name} ({ticker_symbol})")
+                if company_data["financial_currency"] != company_data["price_currency"]:
+                    st.info(
+                        f"Financial statements are in {company_data['financial_currency']}; amounts below are in "
+                        f"{company_data['financial_currency']}. The implied share price is converted to "
+                        f"{company_data['price_currency']} at {fx_rate:.4f}."
+                    )
 
                 # Display starting data
                 st.markdown("### Starting Point: LTM Data")
@@ -1982,20 +2258,17 @@ def render_dcf():
                 with col_ltm2:
                     st.metric("Most Recent Quarter", most_recent_date.strftime('%Y-%m-%d'))
                 with col_ltm3:
-                    st.metric("Shares Outstanding", f"{shares_outstanding/1e6:,.2f}M")
+                    st.metric("Diluted Shares", f"{shares_outstanding/1e6:,.2f}M")
 
                 # Build projections
                 projections = build_dcf_projections(
                     ltm_revenue, most_recent_date,
-                    growth_rates, ebit_margins, reinv_rates, eff_tax_rate
+                    growth_rates, ebit_margins, reinv_rates, eff_tax_rate,
+                    sales_to_capital=projection_s2c,
                 )
 
                 # Calculate valuation
-                if st.session_state.get("historical_analysis_ticker") == ticker_symbol and st.session_state.get("historical_analysis_data") is not None:
-                    terminal_hist = st.session_state["historical_analysis_data"]
-                else:
-                    terminal_hist = get_historical_data(ticker_symbol)
-                terminal_reinv = get_terminal_reinvestment_rate(terminal_hist, terminal_growth)
+                terminal_reinv = get_terminal_reinvestment_rate(terminal_growth, terminal_ronic)
                 if terminal_reinv > 1:
                     st.warning(
                         "The terminal reinvestment rate exceeds 100% of NOPAT, implying negative "
@@ -2005,7 +2278,11 @@ def render_dcf():
                 valuation = calculate_dcf_valuation(
                     projections, wacc, terminal_growth,
                     total_debt, total_cash, shares_outstanding,
-                    terminal_reinvestment_rate=terminal_reinv
+                    terminal_reinvestment_rate=terminal_reinv,
+                    mid_year=mid_year,
+                    non_operating_assets=non_operating_assets,
+                    minority_interest=minority_interest,
+                    fx_rate=fx_rate,
                 )
 
                 # === Display Projections ===
@@ -2034,10 +2311,15 @@ def render_dcf():
                 # === Terminal Value ===
                 st.markdown("### Terminal Value")
 
-                st.latex(r"TV = \frac{NOPAT_{final} \times (1 + g) \times (1 - g/ROC)}{WACC - g}")
+                st.latex(r"TV = \frac{NOPAT_{final} \times (1 + g) \times (1 - g/RONIC)}{WACC - g}")
 
                 final_nopat = projections.iloc[-1]['NOPAT']
                 st.write(f"TV = ({final_nopat/scale_factor:,.2f} × (1 + {terminal_growth:.2%}) × (1 - {terminal_reinv:.2%})) / ({wacc:.2%} - {terminal_growth:.2%})")
+                st.caption(
+                    f"Terminal reinvestment {terminal_reinv:.2%} = g {terminal_growth:.2%} / "
+                    f"return on new capital {terminal_ronic:.2%}"
+                    + f" ({ronic_mode.lower()})."
+                )
 
                 col_tv1, col_tv2 = st.columns(2)
                 with col_tv1:
@@ -2048,7 +2330,10 @@ def render_dcf():
                 # === Enterprise Value ===
                 st.markdown("### Enterprise Value")
 
-                st.latex(r"EV = \sum_{t=1}^{n} \frac{FCF_t}{(1+WACC)^t} + \frac{TV}{(1+WACC)^n}")
+                if mid_year:
+                    st.latex(r"EV = \sum_{t=1}^{n} \frac{FCF_t}{(1+WACC)^{t-0.5}} + \frac{TV}{(1+WACC)^{n-0.5}}")
+                else:
+                    st.latex(r"EV = \sum_{t=1}^{n} \frac{FCF_t}{(1+WACC)^t} + \frac{TV}{(1+WACC)^n}")
 
                 col_ev1, col_ev2, col_ev3 = st.columns(3)
                 with col_ev1:
@@ -2061,15 +2346,19 @@ def render_dcf():
                 # === Equity Value & Share Price ===
                 st.markdown("### Equity Value & Implied Share Price")
 
-                st.latex(r"Equity\ Value = EV - Debt + Cash")
-                st.latex(r"Share\ Price = \frac{Equity\ Value}{Shares\ Outstanding}")
+                st.latex(r"Equity\ Value = EV - Debt + Cash + Non\text{-}operating\ Investments - Minority\ Interest")
+                st.latex(r"Share\ Price = \frac{Equity\ Value}{Diluted\ Shares}")
 
-                col_eq1, col_eq2, col_eq3 = st.columns(3)
+                col_eq1, col_eq2, col_eq3, col_eq4, col_eq5 = st.columns(5)
                 with col_eq1:
                     st.metric("Total Debt", f"{total_debt/scale_factor:,.2f} {scale_name}")
                 with col_eq2:
                     st.metric("Total Cash", f"{total_cash/scale_factor:,.2f} {scale_name}")
                 with col_eq3:
+                    st.metric("Non-op. Investments", f"{non_operating_assets/scale_factor:,.2f} {scale_name}")
+                with col_eq4:
+                    st.metric("Minority Interest", f"{minority_interest/scale_factor:,.2f} {scale_name}")
+                with col_eq5:
                     st.metric("Equity Value", f"{valuation['equity_value']/scale_factor:,.2f} {scale_name}")
 
                 st.divider()
@@ -2096,7 +2385,6 @@ def render_dcf():
                 wacc_high = st.number_input("High WACC (%)", value=(wacc*100 + 1.5), step=0.25, key="wacc_high") / 100
 
                 sensitivity_results = []
-                sensitivity_terminal_reinv = get_terminal_reinvestment_rate(terminal_hist, terminal_growth)
                 for w in [wacc_low, wacc, wacc_high]:
                     if not np.isfinite(w) or w <= 0 or terminal_growth >= w:
                         sensitivity_results.append({
@@ -2109,12 +2397,19 @@ def render_dcf():
                         continue
                     proj_copy = build_dcf_projections(
                         ltm_revenue, most_recent_date,
-                        growth_rates, ebit_margins, reinv_rates, eff_tax_rate
+                        growth_rates, ebit_margins, reinv_rates, eff_tax_rate,
+                        sales_to_capital=projection_s2c,
                     )
                     val = calculate_dcf_valuation(
                         proj_copy, w, terminal_growth,
                         total_debt, total_cash, shares_outstanding,
-                        terminal_reinvestment_rate=sensitivity_terminal_reinv
+                        terminal_reinvestment_rate=get_terminal_reinvestment_rate(
+                            terminal_growth, terminal_ronic_for(w)
+                        ),
+                        mid_year=mid_year,
+                        non_operating_assets=non_operating_assets,
+                        minority_interest=minority_interest,
+                        fx_rate=fx_rate,
                     )
                     sensitivity_results.append({
                         'WACC': f"{w:.2%}",
@@ -2142,8 +2437,10 @@ def render_dcf():
                         "Enterprise Value",
                         "Less: Total Debt",
                         "Plus: Total Cash",
+                        "Plus: Non-operating Investments",
+                        "Less: Minority Interest",
                         "Equity Value",
-                        "Shares Outstanding",
+                        "Diluted Shares",
                         "Implied Share Price",
                         "Current Market Price",
                         "Upside/Downside"
@@ -2160,6 +2457,8 @@ def render_dcf():
                         f"{valuation['enterprise_value']/scale_factor:,.2f} {scale_name}",
                         f"({total_debt/scale_factor:,.2f}) {scale_name}",
                         f"{total_cash/scale_factor:,.2f} {scale_name}",
+                        f"{non_operating_assets/scale_factor:,.2f} {scale_name}",
+                        f"({minority_interest/scale_factor:,.2f}) {scale_name}",
                         f"{valuation['equity_value']/scale_factor:,.2f} {scale_name}",
                         f"{shares_outstanding/1e6:,.2f}M",
                         f"${implied_price:,.2f}",
