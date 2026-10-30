@@ -28,7 +28,7 @@ Deploy your own instance via [Streamlit Cloud](https://share.streamlit.io)
 - Uses LTM (Last Twelve Months) revenue as starting point
 - Three-stage revenue growth: analyst-consensus year-1 growth is held for the high-growth years (3 by default when consensus is 20% or less), then fades front-loaded to perpetual growth
 - Growth-linked reinvestment (default): reinvestment = change in revenue / sales-to-capital, so today's growth capex is paired with the revenue it produces instead of being treated as a pure cost; manual reinvestment rates (% of NOPAT) remain available
-- Perpetual growth defaults to the lower of the risk-free rate and 3% (long-run nominal GDP) and must stay below WACC
+- Perpetual growth defaults to the risk-free rate (long-run nominal growth proxy) and must stay below WACC
 - Terminal value via Gordon Growth with reinvestment g / RONIC, mid-year discounting
 - Cross-checks: exit-multiple terminal value (EV/EBITDA) and a reverse DCF that solves for the market-implied year-1 growth
 - Separate bear / base / bull prices (growth and margin swings, not averaged) and a WACC × perpetual-growth sensitivity grid

@@ -1423,14 +1423,10 @@ def get_historical_data(ticker_symbol):
     }
 
 
-# Long-run nominal GDP growth (~2% real + ~2% inflation, less a margin for
-# mature firms lagging the economy). Perpetual growth defaults to the lower of
-# this and the risk-free rate, so a high-rate regime doesn't inflate terminal value.
-LONG_RUN_GROWTH_CAP = 0.03
-
-
 def default_stable_growth(risk_free_rate):
-    return float(np.clip(risk_free_rate, 0.0, LONG_RUN_GROWTH_CAP))
+    """Perpetual growth defaults to the risk-free rate, the market's proxy for
+    long-run nominal growth (Damodaran)."""
+    return max(float(risk_free_rate), 0.0)
 
 
 def calculate_terminal_growth_rate(historical_data, risk_free_rate):
@@ -1463,7 +1459,7 @@ def calculate_terminal_growth_rate(historical_data, risk_free_rate):
     if not np.isfinite(historical_growth):
         historical_growth = np.nan
     method = (
-        'Stable growth is the lower of the risk-free rate and long-run nominal GDP growth (3%); '
+        'Stable growth is set to the risk-free rate, the proxy for long-run nominal economic growth; '
         'historical sustainable growth is shown for reference only'
     )
     terminal_growth = default_stable_growth(risk_free_rate)
@@ -2384,8 +2380,8 @@ def render_dcf():
     with col2:
         terminal_growth = st.number_input(
             "Perpetual Growth (%)", step=0.25, key="dcf_terminal_growth_rate",
-            help="Growth after the forecast, forever. Defaults to the lower of the risk-free rate and 3% "
-                 "(long-run nominal GDP) and must stay below WACC."
+            help="Growth after the forecast, forever. Defaults to the risk-free rate "
+                 "(long-run nominal growth proxy) and must stay below WACC."
         ) / 100
     with col3:
         eff_tax_rate = st.number_input(
@@ -2402,8 +2398,8 @@ def render_dcf():
         return
     if terminal_growth > default_stable_growth(risk_free_rate) + 0.0001:
         st.warning(
-            f"Perpetual growth ({terminal_growth:.2%}) is above the {default_stable_growth(risk_free_rate):.2%} default "
-            "(the lower of the risk-free rate and long-run nominal GDP). No company outgrows the economy forever."
+            f"Perpetual growth ({terminal_growth:.2%}) is above the risk-free rate ({risk_free_rate:.2%}), "
+            "the proxy for long-run nominal growth. No company outgrows the economy forever."
         )
 
     col_h, col_g, col_m = st.columns(3)
