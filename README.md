@@ -26,16 +26,13 @@ Deploy your own instance via [Streamlit Cloud](https://share.streamlit.io)
 
 ### DCF Model
 - Uses LTM (Last Twelve Months) revenue as starting point
-- Customizable projection assumptions:
-  - Revenue growth rates by year
-  - EBIT margins by year
-  - Reinvestment rates by year
-  - Two assumptions transition linearly from year 1 to the final forecast year
-- Terminal value via Gordon Growth Model
-- Discounts all cash flows to present value
-- Computes implied share price vs current market price
-- Sensitivity analysis for different WACC scenarios
-- Uncapped, editable annual and long-term growth assumptions; the recommended perpetual rate is bounded by the risk-free rate as a long-run nominal-growth ceiling, and must remain below WACC for a finite terminal value
+- Three-stage revenue growth: analyst-consensus year-1 growth is held for the high-growth years (3 by default when consensus is 20% or less), then fades front-loaded to perpetual growth
+- Growth-linked reinvestment (default): reinvestment = change in revenue / sales-to-capital, so today's growth capex is paired with the revenue it produces instead of being treated as a pure cost; manual reinvestment rates (% of NOPAT) remain available
+- Perpetual growth defaults to the lower of the risk-free rate and 3% (long-run nominal GDP) and must stay below WACC
+- Terminal value via Gordon Growth with reinvestment g / RONIC, mid-year discounting
+- Cross-checks: exit-multiple terminal value (EV/EBITDA) and a reverse DCF that solves for the market-implied year-1 growth
+- Bear / base / bull scenarios (growth and margin swings, weighted) and a WACC × perpetual-growth sensitivity grid
+- Flags sectors where an FCFF DCF is a weak fit (banks, insurers, broker-dealers, REITs, regulated utilities, oil & gas, pre-profit biotech) and names the better method
 
 ## Installation
 
@@ -64,7 +61,7 @@ streamlit run app.py
 | `WACC = w_E × k_E + w_D × k_D × (1-t)` | Weighted Average Cost of Capital |
 | `k_E = r_f + β × EMRP` | Cost of Equity (CAPM) |
 | `k_D = r_f + spread` | Cost of Debt |
-| `FCF = NOPAT × (1 - Reinvestment Rate)` | Free Cash Flow |
+| `FCF = NOPAT − ΔRevenue / Sales-to-Capital` | Free Cash Flow (growth-linked reinvestment) |
 | `TV = NOPAT_n × (1 + g) × (1 - g/RONIC) / (WACC - g)` | Terminal Value (Gordon Growth), with terminal reinvestment implied by `g / RONIC` (return on new invested capital) |
 
 The DCF tab values free cash flow to the firm and is not directly comparable to a dividend discount model. Its long-term growth assumption applies perpetually after the explicit revenue-growth forecast; it is not a forecast-period growth rate. Historical reinvestment × return on capital is shown as a sustainable-growth diagnostic, not automatically treated as perpetual growth: unusually high company growth cannot be extrapolated forever. The recommended stable rate is limited by the risk-free rate (a nominal-growth ceiling), remains editable, and is checked against WACC, consistent with [Damodaran's stable-growth guidance](https://pages.stern.nyu.edu/~adamodar/pdfiles/valonlineslides/session9.pdf). A Gordon Growth terminal value is undefined when long-term growth is at or above WACC.

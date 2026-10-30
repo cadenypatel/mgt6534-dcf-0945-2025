@@ -55,6 +55,7 @@ def inject_styles():
         div[data-testid="stMetricLabel"] p { font-size: .76rem; text-transform: uppercase; letter-spacing: .06em; }
         .stButton > button[kind="primary"] { background: var(--teal); border: 0; border-radius: 6px; font-weight: 800; }
         .stButton > button[kind="primary"]:hover { background: #095b55; }
+        .stButton > button[kind="primary"] p { color: #ffffff; }
         [data-testid="stDataFrame"] { border: 1px solid var(--line); }
         code { font-family: 'DM Mono', monospace; }
         </style>
@@ -548,6 +549,7 @@ def _average_historical_reinvestment_rate(stats, fallback=0.25):
     return float(np.average(historical_rates.to_numpy(), weights=weights))
 
 
+@st.cache_data(ttl=900, show_spinner=False)
 def get_company_market_data(ticker_symbol):
     """Resolve core company data with fallbacks for hosted Yahoo responses."""
     ticker = yf.Ticker(ticker_symbol)
@@ -697,7 +699,47 @@ def get_company_market_data(ticker_symbol):
         "non_operating_assets": non_operating_assets,
         "minority_interest": minority_interest,
         "current_price": current_price,
+        "sector": ticker_info.get("sector") or "",
+        "industry": ticker_info.get("industry") or "",
+        "ev_to_ebitda": _positive_number(ticker_info.get("enterpriseToEbitda")),
     }
+
+
+# DCF on free cash flow to the firm misreads businesses whose economics run
+# through the balance sheet, regulators, or commodity prices. Each entry is
+# (sector, industry keywords, why, better method).
+MODEL_FIT_RULES = [
+    ("Financial Services", ("bank",),
+     "Debt is a bank's raw material, so free cash flow to the firm isn't meaningful.",
+     "price-to-tangible-book vs ROE, or a dividend / excess-return model"),
+    ("Financial Services", ("insurance",),
+     "Float and reserves distort an insurer's cash flows.",
+     "price-to-book vs ROE and the combined ratio"),
+    ("Financial Services", ("capital markets",),
+     "Broker-dealer balance sheets make free cash flow to the firm unreliable.",
+     "price-to-tangible-book vs ROE, or an excess-return model"),
+    ("Real Estate", ("reit",),
+     "REIT value sits in the properties and is distributed through FFO.",
+     "price / FFO (AFFO) and net asset value"),
+    ("Utilities", ("regulated", "utilities"),
+     "Regulators set a utility's allowed return, so growth tracks the rate base.",
+     "a dividend discount model or rate-base growth with P/E vs peers"),
+    ("Energy", ("oil & gas e&p", "oil & gas integrated", "oil & gas drilling"),
+     "Cash flow swings with commodity prices, so the latest year is rarely normal.",
+     "this DCF at a mid-cycle commodity price, cross-checked with reserve NAV and EV/EBITDA"),
+    ("Healthcare", ("biotechnology",),
+     "Pre-profit biotech value depends on drug-approval odds, not current cash flow.",
+     "risk-adjusted NPV (probability-weighted pipeline)"),
+]
+
+
+def get_model_fit_warning(sector, industry):
+    """Return (why, better method) when a sector is a poor fit for an FCFF DCF."""
+    industry = (industry or "").lower()
+    for rule_sector, keywords, why, method in MODEL_FIT_RULES:
+        if sector == rule_sector and any(keyword in industry for keyword in keywords):
+            return why, method
+    return None
 
 
 def get_wacc_input_defaults(ticker_symbol):
@@ -1381,6 +1423,16 @@ def get_historical_data(ticker_symbol):
     }
 
 
+# Long-run nominal GDP growth (~2% real + ~2% inflation, less a margin for
+# mature firms lagging the economy). Perpetual growth defaults to the lower of
+# this and the risk-free rate, so a high-rate regime doesn't inflate terminal value.
+LONG_RUN_GROWTH_CAP = 0.03
+
+
+def default_stable_growth(risk_free_rate):
+    return float(np.clip(risk_free_rate, 0.0, LONG_RUN_GROWTH_CAP))
+
+
 def calculate_terminal_growth_rate(historical_data, risk_free_rate):
     """Recommend stable growth equal to the risk-free rate (Damodaran's default:
     a firm can't outgrow the nominal economy forever, and the risk-free rate is
@@ -1411,10 +1463,10 @@ def calculate_terminal_growth_rate(historical_data, risk_free_rate):
     if not np.isfinite(historical_growth):
         historical_growth = np.nan
     method = (
-        'Stable growth is set to the risk-free rate, the proxy for long-run nominal economic growth; '
+        'Stable growth is the lower of the risk-free rate and long-run nominal GDP growth (3%); '
         'historical sustainable growth is shown for reference only'
     )
-    terminal_growth = max(float(risk_free_rate), 0.0)
+    terminal_growth = default_stable_growth(risk_free_rate)
     return (
         terminal_growth,
         average_reinvestment,
@@ -1484,7 +1536,7 @@ def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, for
     }
     stats = historical_data['df_stats'].replace([np.inf, -np.inf], np.nan)
     income_statement = historical_data.get('income_statement', pd.DataFrame())
-    stable_growth = max(float(risk_free_rate), 0.0)
+    stable_growth = default_stable_growth(risk_free_rate)
     return_on_capital = _recency_weighted_average(stats['Return on Capital'].dropna())
     historical_roc = float(return_on_capital) if np.isfinite(return_on_capital) else None
 
@@ -1532,6 +1584,23 @@ def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, for
         and ebit_series.dropna().max() <= 0
     )
     defaults['Historical ROC'] = historical_roc
+
+    # Sales-to-capital links growth to the capital needed to fund it
+    # (Damodaran): reinvestment = change in revenue / sales-to-capital.
+    sales_to_capital = _recency_weighted_average(stats['Sales to Capital'].dropna())
+    defaults['Sales to Capital'] = (
+        float(np.clip(sales_to_capital, 0.25, 15.0)) if np.isfinite(sales_to_capital) else 1.5
+    )
+
+    # D&A as a share of revenue turns projected EBIT into EBITDA for the
+    # exit-multiple cross-check.
+    merged_cf = historical_data.get('merged_cf', pd.DataFrame())
+    da_ratio = np.nan
+    if revenue_series is not None and 'Depreciation And Amortization' in merged_cf:
+        ratio = (merged_cf['Depreciation And Amortization'] / revenue_series).replace([np.inf, -np.inf], np.nan).dropna()
+        if not ratio.empty:
+            da_ratio = float(ratio.iloc[-1])
+    defaults['D&A % Revenue'] = da_ratio if np.isfinite(da_ratio) and da_ratio >= 0 else 0.0
 
     if no_positive_operations:
         defaults['Revenue Growth'] = 0.0
@@ -1595,6 +1664,20 @@ def expand_projection_input(raw_value, label, horizon=None, converge=False):
     raise ValueError(f"{label} must contain one value, two values (for 2-stage horizons), or exactly {horizon} yearly values.")
 
 
+def build_growth_path(values, horizon, hold_years=1, shift=0.0):
+    """Three-stage revenue growth: hold year-1 growth (plus `shift`) for
+    `hold_years`, then fade front-loaded to the final value. One value holds
+    constant; a full list of yearly values is shifted as-is."""
+    if len(values) == horizon and horizon >= 2:
+        return [value + shift for value in values]
+    if len(values) == 1:
+        return [values[0] + shift] * horizon
+    start, end = values[0] + shift, values[-1]
+    hold_years = int(np.clip(hold_years, 1, horizon))
+    return [start] * (hold_years - 1) + _converging_path(start, end, horizon - hold_years + 1)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def get_ltm_revenue(ticker_symbol):
     """Get a reliable LTM revenue from the latest four valid quarters."""
     ticker = yf.Ticker(ticker_symbol)
@@ -1650,11 +1733,20 @@ def get_ltm_revenue(ticker_symbol):
     return ltm_revenue, most_recent_date
 
 
-def build_dcf_projections(ltm_revenue, most_recent_date, growth_rates, ebit_margins, reinv_rates, eff_tax_rate):
-    """Build projections dataframe for DCF model."""
+def build_dcf_projections(ltm_revenue, most_recent_date, growth_rates, ebit_margins, reinv_rates, eff_tax_rate,
+                          sales_to_capital=None):
+    """Build projections dataframe for DCF model.
+
+    With `sales_to_capital`, reinvestment funds the growth it buys:
+    reinvestment = change in revenue / sales-to-capital, so heavy spending
+    today is paired with the revenue it produces instead of being a pure cost.
+    Otherwise reinvestment is NOPAT × the given reinvestment rates.
+    """
     time_horizon = len(growth_rates)
     if time_horizon == 0:
         raise ValueError("At least one projection year is required.")
+    if reinv_rates is None:
+        reinv_rates = [0.0] * time_horizon
     if not all(np.isfinite(values).all() for values in (growth_rates, ebit_margins, reinv_rates)):
         raise ValueError("Projection assumptions must contain finite numbers.")
     if not np.isfinite(ltm_revenue) or not np.isfinite(eff_tax_rate):
@@ -1685,7 +1777,17 @@ def build_dcf_projections(ltm_revenue, most_recent_date, growth_rates, ebit_marg
     projections['Revenue'] = projected_revenue
     projections['EBIT'] = projections['Revenue'] * projections['EBIT Margin']
     projections['NOPAT'] = projections['EBIT'] * (1 - eff_tax_rate)
-    projections['Reinvestment'] = projections['NOPAT'] * projections['Reinv Rate']
+    if sales_to_capital is not None:
+        if not np.isfinite(sales_to_capital) or sales_to_capital <= 0:
+            raise ValueError("Sales-to-capital must be greater than zero.")
+        revenue_change = projections['Revenue'].diff()
+        revenue_change.iloc[0] = projections['Revenue'].iloc[0] - ltm_revenue
+        projections['Reinvestment'] = revenue_change / sales_to_capital
+        projections['Reinv Rate'] = (
+            projections['Reinvestment'] / projections['NOPAT']
+        ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    else:
+        projections['Reinvestment'] = projections['NOPAT'] * projections['Reinv Rate']
     projections['FCF'] = projections['NOPAT'] - projections['Reinvestment']
     projections['T'] = range(1, time_horizon + 1)
 
@@ -1779,6 +1881,65 @@ def calculate_dcf_valuation(projections, wacc, terminal_growth, total_debt, tota
         'projections': projections
     }
 
+
+def run_dcf_case(case, wacc, terminal_growth, terminal_reinvestment_rate, growth_shift=0.0, margin_shift=0.0):
+    """Value one case. `case` holds everything that doesn't change between
+    scenarios (LTM base, input values, balance-sheet bridge); shifts move
+    year-1 growth and every year's margin."""
+    growth_rates = build_growth_path(case['growth_values'], case['horizon'], case['hold_years'], growth_shift)
+    ebit_margins = [margin + margin_shift for margin in case['ebit_margins']]
+    projections = build_dcf_projections(
+        case['ltm_revenue'], case['ltm_date'], growth_rates, ebit_margins,
+        case['reinv_rates'], case['tax_rate'], sales_to_capital=case['sales_to_capital'],
+    )
+    return calculate_dcf_valuation(
+        projections, wacc, terminal_growth,
+        case['total_debt'], case['total_cash'], case['shares'],
+        terminal_reinvestment_rate=terminal_reinvestment_rate,
+        non_operating_assets=case['non_operating_assets'],
+        minority_interest=case['minority_interest'],
+        fx_rate=case['fx_rate'],
+    )
+
+
+def exit_multiple_price(valuation, case, wacc, exit_multiple):
+    """Share price with the terminal value set at an EV/EBITDA exit multiple
+    instead of perpetual growth (a cross-check on the Gordon terminal value)."""
+    final = valuation['projections'].iloc[-1]
+    final_ebitda = final['EBIT'] + final['Revenue'] * case['da_ratio']
+    terminal_value = final_ebitda * exit_multiple
+    # An exit at year-end is discounted a full n years, not mid-year.
+    pv_terminal = terminal_value / (1 + wacc) ** case['horizon']
+    enterprise_value = valuation['pv_fcf'] + pv_terminal
+    equity_value = (enterprise_value - case['total_debt'] + case['total_cash']
+                    + case['non_operating_assets'] - case['minority_interest'])
+    return equity_value * case['fx_rate'] / case['shares'], final_ebitda
+
+
+def solve_implied_growth(case, wacc, terminal_growth, terminal_reinvestment_rate, target_price):
+    """Reverse DCF: the year-1 revenue growth (same hold and fade) at which
+    the model's value equals the market price. None if out of range."""
+    base_start = case['growth_values'][0]
+
+    def gap(shift):
+        return run_dcf_case(case, wacc, terminal_growth, terminal_reinvestment_rate, shift)['share_price'] - target_price
+
+    low, high = -0.5 - base_start, 1.5 - base_start
+    try:
+        gap_low, gap_high = gap(low), gap(high)
+    except ValueError:
+        return None
+    if gap_low * gap_high > 0:
+        return None
+    for _ in range(60):
+        mid = (low + high) / 2
+        gap_mid = gap(mid)
+        if gap_low * gap_mid <= 0:
+            high = mid
+        else:
+            low, gap_low = mid, gap_mid
+    return base_start + (low + high) / 2
+
 # ============================================================================
 # Page: Home
 # ============================================================================
@@ -1810,8 +1971,8 @@ def render_home():
     step_cols = st.columns(3, gap="medium")
     steps = [
         ("01 / Capital", "WACC Calculator", "Estimate beta, cost of equity, cost of debt, and the discount rate."),
-        ("02 / Evidence", "Historical Analysis", "Read growth, margins, working capital, and reinvestment across reported periods."),
-        ("03 / Value", "DCF Model", "Project free cash flow, discount terminal value, and compare implied value with price."),
+        ("02 / Evidence", "Historical Analysis", "Read growth, margins, returns on capital, and maintenance vs growth capex."),
+        ("03 / Value", "DCF Model", "Value forward cash flow, then test it with an exit multiple, reverse DCF, and scenarios."),
     ]
     for column, (eyebrow, title, description) in zip(step_cols, steps):
         with column:
@@ -1829,8 +1990,8 @@ def render_home():
         st.latex(r"k_E = r_f + \beta \times EMRP")
 
     with col2:
-        st.markdown("**Free Cash Flow**")
-        st.latex(r"FCF = NOPAT \times (1 - ReinvestmentRate)")
+        st.markdown("**Free Cash Flow (growth-linked)**")
+        st.latex(r"FCF = NOPAT - \frac{\Delta Revenue}{Sales\ to\ Capital}")
 
         st.markdown("**Terminal Value**")
         st.latex(r"TV = \frac{NOPAT_{final} \times (1 + g) \times (1 - g/RONIC)}{WACC - g}")
@@ -1941,124 +2102,51 @@ def render_wacc():
                 st.session_state["wacc_calculated_ticker"] = ticker_symbol
                 st.session_state["wacc_calculated_rate"] = wacc
 
-                # Display results
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    st.markdown("**Capital Structure**")
-                    st.metric("Market Cap", f"${market_cap/1e9:,.2f}B")
-                    st.metric("Total Debt", f"${total_debt/1e9:,.2f}B")
-                    st.metric("Equity Weight (w_E)", f"{w_E:.2%}")
-                    st.metric("Debt Weight (w_D)", f"{w_D:.2%}")
-
-                with col2:
-                    st.markdown("**Beta Estimation**")
-                    st.metric("Beta Used (β)", f"{beta:.3f}")
-                    st.caption(beta_note)
-                    st.caption(
-                        f"Regression: raw {raw_beta:.3f} → Blume-adjusted {regression_beta:.3f} "
-                        f"(R² {r_squared:.3f}, 5-year monthly returns vs S&P 500)"
+                st.markdown(
+                    "<div style='display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin:.5rem 0 1rem'>"
+                    + kpi_card("WACC", f"{wacc:.2%}", "Loaded into the DCF tab")
+                    + kpi_card("Cost of Equity", f"{cost_of_equity:.2%}", f"{risk_free_rate:.2%} + {beta:.2f} × {emrp:.2%}")
+                    + kpi_card("After-Tax Cost of Debt", f"{cost_of_debt * (1 - marg_tax_rate):.2%}",
+                               f"({risk_free_rate:.2%} + {credit_spread:.2%} {firm_rating}) × (1 − {marg_tax_rate:.0%})")
+                    + kpi_card("Weights", f"{w_E:.0%} / {w_D:.0%}", "Equity / debt at market value")
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
+                st.caption(f"Beta {beta:.3f}: {beta_note}")
+                st.caption(
+                    f"Regression: raw {raw_beta:.3f} → Blume-adjusted {regression_beta:.3f} "
+                    f"(R² {r_squared:.3f}, 5-year monthly vs S&P 500)"
+                    + (
+                        f" · Bottom-up: {bottom_up[1]} unlevered {bottom_up[2]:.2f} relevered at D/E "
+                        f"{total_debt / market_cap:.1%} → {bottom_up[0]:.3f}"
+                        if bottom_up else ""
                     )
-                    if bottom_up:
-                        st.caption(
-                            f"Bottom-up: {bottom_up[1]} unlevered {bottom_up[2]:.2f} relevered at D/E "
-                            f"{total_debt / market_cap:.1%} → {bottom_up[0]:.3f} (Damodaran, latest)"
-                        )
+                )
+                st.caption(
+                    f"Market cap \\${market_cap / 1e9:,.1f}B · total debt \\${total_debt / 1e9:,.1f}B · "
+                    "spread from Damodaran's latest rating table."
+                )
+                st.session_state["dcf_wacc_rate"] = wacc * 100
 
-                st.divider()
-
-                col3, col4 = st.columns(2)
-
-                with col3:
-                    st.markdown("**Cost of Equity**")
-                    st.latex(r"k_E = r_f + \beta \times EMRP")
-                    st.write(f"k_E = {risk_free_rate:.2%} + {beta:.3f} × {emrp:.2%}")
-                    st.metric("Cost of Equity (k_E)", f"{cost_of_equity:.2%}")
-
-                with col4:
-                    st.markdown("**Cost of Debt**")
-                    st.latex(r"k_D = r_f + spread")
-                    st.write(f"k_D = {risk_free_rate:.2%} + {credit_spread:.2%}")
-                    st.caption("Spread from Damodaran's latest rating/spread table.")
-                    st.metric("Cost of Debt (k_D)", f"{cost_of_debt:.2%}")
-                    st.caption(f"Credit Rating: {firm_rating}")
-
-                st.divider()
-
-                # Final WACC
-                st.markdown("**Weighted Average Cost of Capital**")
-                st.latex(r"WACC = w_E \times k_E + w_D \times k_D \times (1-t)")
-                st.write(f"WACC = {w_E:.2%} × {cost_of_equity:.2%} + {w_D:.2%} × {cost_of_debt:.2%} × (1 - {marg_tax_rate:.0%})")
-
-                st.markdown(f"<h1 style='text-align: center; color: #1f77b4;'>WACC = {wacc:.2%}</h1>", unsafe_allow_html=True)
-
-                # Separate historical sustainable growth from perpetual stable growth.
+                # Perpetual growth defaults to the risk-free rate (long-run
+                # nominal GDP proxy); load it and the historicals into the DCF.
                 try:
                     historical_data = get_historical_data(ticker_symbol)
                     st.session_state["historical_analysis_data"] = historical_data
                     st.session_state["historical_analysis_ticker"] = ticker_symbol
                     st.session_state["dcf_projection_refresh_needed"] = True
-                    (
-                        terminal_growth,
-                        average_reinvestment,
-                        average_return_on_capital,
-                        historical_growth,
-                        growth_method,
-                    ) = calculate_terminal_growth_rate(
-                        historical_data, risk_free_rate
-                    )
-                    st.session_state["dcf_wacc_rate"] = wacc * 100
-
-                    st.markdown("**Stable Growth Estimate**")
-                    st.latex(r"g_{\text{sustainable}} = Reinvestment\ Rate \times Return\ on\ Capital")
-                    growth_col1, growth_col2, growth_col3, growth_col4 = st.columns(4)
-                    with growth_col1:
-                        reinvestment_display = (
-                            f"{average_reinvestment:.2%}"
-                            if np.isfinite(average_reinvestment)
-                            else "N/A"
-                        )
-                        st.metric("Historical Reinvestment Rate", reinvestment_display)
-                    with growth_col2:
-                        roc_display = (
-                            f"{average_return_on_capital:.2%}"
-                            if np.isfinite(average_return_on_capital)
-                            else "N/A"
-                        )
-                        st.metric("Normalized Return on Capital", roc_display)
-                    with growth_col3:
-                        st.metric(
-                            "Historical Sustainable Growth",
-                            f"{historical_growth:.2%}" if np.isfinite(historical_growth) else "N/A",
-                        )
-                    with growth_col4:
-                        st.metric("Recommended Stable Growth", f"{terminal_growth:.2%}")
-                    st.caption(f"{growth_method}.")
+                    terminal_growth = calculate_terminal_growth_rate(historical_data, risk_free_rate)[0]
                     if terminal_growth >= wacc:
                         st.warning(
-                            f"The recommended stable growth ({terminal_growth:.2%}) is not below WACC ({wacc:.2%}). "
-                            "Review the WACC inputs; no terminal growth assumption was loaded into the DCF."
+                            f"The risk-free rate ({terminal_growth:.2%}) is not below WACC ({wacc:.2%}), so no "
+                            "perpetual growth rate was loaded into the DCF. Review the WACC inputs."
                         )
                     else:
                         st.session_state["wacc_terminal_growth_ticker"] = ticker_symbol
                         st.session_state["wacc_terminal_growth_rate"] = terminal_growth
                         st.session_state["dcf_terminal_growth_rate"] = terminal_growth * 100
-                        st.info("The recommended stable growth rate is now loaded into the DCF Model tab.")
                 except Exception as growth_error:
-                    st.warning(f"WACC calculated, but long-term growth could not be estimated from historicals: {growth_error}")
-
-                # Summary table
-                st.markdown("**Summary**")
-                summary_df = pd.DataFrame({
-                    "Metric": ["Risk-Free Rate", "Beta", "EMRP", "Cost of Equity",
-                              "Credit Spread", "Cost of Debt", "Equity Weight",
-                              "Debt Weight", "Tax Rate", "WACC"],
-                    "Value": [f"{risk_free_rate:.2%}", f"{beta:.3f}", f"{emrp:.2%}",
-                             f"{cost_of_equity:.2%}", f"{credit_spread:.2%}",
-                             f"{cost_of_debt:.2%}", f"{w_E:.2%}", f"{w_D:.2%}",
-                             f"{marg_tax_rate:.0%}", f"{wacc:.2%}"]
-                })
-                st.dataframe(summary_df, use_container_width=True, hide_index=True)
+                    st.warning(f"WACC calculated, but historicals could not be loaded for the DCF: {growth_error}")
 
             except Exception as e:
                 st.error(f"Error: {str(e)}")
@@ -2069,7 +2157,7 @@ def render_wacc():
 
 def render_historical():
     st.header("Historical Analysis")
-    st.markdown("Analyze historical financial performance: growth rates, margins, and reinvestment.")
+    st.markdown("Growth, margins, returns on capital, and how much of capex is maintenance vs growth.")
 
     ticker_symbol = st.session_state.get("shared_ticker_symbol", "MSFT").strip().upper()
 
@@ -2108,111 +2196,70 @@ def render_historical():
                 st.subheader(f"{company_name} ({ticker_symbol})")
 
                 income_statement = data['income_statement']
-                balance_sheet = data['balance_sheet']
                 merged_cf = data['merged_cf']
                 df_stats = data['df_stats']
 
-                # Section 1: Revenue and EBIT
-                st.markdown("### Income Statement Highlights")
+                def dated(frame):
+                    frame = frame.copy()
+                    frame.index = frame.index.strftime('%b %Y')
+                    return frame.T
 
-                is_display = income_statement[['Total Revenue', 'EBIT', 'Gross Profit']].copy()
-                is_display = is_display / scale_factor
-                is_display.index = is_display.index.strftime('%Y-%m-%d')
-                st.dataframe(is_display.style.format("{:,.2f}"), use_container_width=True)
-                st.caption(f"Values in {scale_name}")
+                # Drivers the DCF projects: growth, margins, returns.
+                st.markdown("### Operating Drivers")
+                drivers = income_statement[['Total Revenue', 'EBIT']].div(scale_factor).join(
+                    df_stats[['Revenue Growth', 'Gross Margin', 'EBIT Margin', 'Return on Capital', 'Sales to Capital']]
+                )
+                drivers = dated(drivers.rename(columns={'Total Revenue': f'Revenue ({scale_name})',
+                                                        'EBIT': f'EBIT ({scale_name})'}))
+                money_rows = [f'Revenue ({scale_name})', f'EBIT ({scale_name})']
+                pct_rows = ['Revenue Growth', 'Gross Margin', 'EBIT Margin', 'Return on Capital']
+                st.dataframe(
+                    drivers.style.format("{:,.1f}", na_rep="—", subset=pd.IndexSlice[money_rows, :])
+                                 .format("{:.1%}", na_rep="—", subset=pd.IndexSlice[pct_rows, :])
+                                 .format("{:.2f}x", na_rep="—", subset=pd.IndexSlice[['Sales to Capital'], :]),
+                    width="stretch",
+                )
 
-                # Section 2: Growth Rates and Margins
-                st.markdown("### Growth Rates & Margins")
+                # Capex split: D&A approximates the spend needed to maintain
+                # the asset base; the rest is growth capex that should buy
+                # future revenue rather than count as a pure cost.
+                st.markdown("### Reinvestment: Maintenance vs Growth")
+                reinvestment = pd.DataFrame({
+                    'Total CapEx': merged_cf['Capital Expenditure'],
+                    'Maintenance (≈ D&A)': merged_cf['Depreciation And Amortization'],
+                    'Growth CapEx': merged_cf['Capital Expenditure'] - merged_cf['Depreciation And Amortization'],
+                    'Change in NWC': merged_cf['Ch in NWC'],
+                    'Net Reinvestment': merged_cf['Reinvestment'],
+                }).div(scale_factor)
+                reinvestment['Reinv % NOPAT'] = df_stats['Reinv Rate']
+                reinvestment = dated(reinvestment)
+                st.dataframe(
+                    reinvestment.style.format("{:,.1f}", na_rep="—", subset=pd.IndexSlice[reinvestment.index[:-1], :])
+                                      .format("{:.1%}", na_rep="—", subset=pd.IndexSlice[['Reinv % NOPAT'], :]),
+                    width="stretch",
+                )
+                st.caption(
+                    f"{scale_name} · Net reinvestment = growth capex + change in working capital. "
+                    "A jump in growth capex is investment for future revenue; the DCF's growth-linked method "
+                    "pairs it with that revenue through sales-to-capital."
+                )
 
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    st.markdown("**Growth Rates**")
-                    growth_df = df_stats[['Revenue Growth', 'EBIT Growth']].copy()
-                    growth_df.index = growth_df.index.strftime('%Y-%m-%d')
-                    st.dataframe(growth_df.style.format("{:.2%}"), use_container_width=True)
-
-                with col2:
-                    st.markdown("**Margins**")
-                    margin_df = df_stats[['Gross Margin', 'EBIT Margin']].copy()
-                    margin_df.index = margin_df.index.strftime('%Y-%m-%d')
-                    st.dataframe(margin_df.style.format("{:.2%}"), use_container_width=True)
-
-                # Section 3: NWC Analysis
-                st.markdown("### Working Capital Analysis")
-
-                nwc_df = balance_sheet[['NWC', 'Ch in NWC']].copy()
-                nwc_df = nwc_df / scale_factor
-                nwc_df.index = nwc_df.index.strftime('%Y-%m-%d')
-                st.dataframe(nwc_df.style.format("{:,.2f}"), use_container_width=True)
-                st.caption(f"Values in {scale_name}")
-
-                # Section 4: Reinvestment
-                st.markdown("### Reinvestment Analysis")
-
-                reinv_df = merged_cf[['Capital Expenditure', 'Depreciation And Amortization', 'Ch in NWC', 'Reinvestment']].copy()
-                reinv_df = reinv_df / scale_factor
-                reinv_df.index = reinv_df.index.strftime('%Y-%m-%d')
-                st.dataframe(reinv_df.style.format("{:,.2f}"), use_container_width=True)
-                st.caption(f"Reinvestment = CapEx - D&A + Change in NWC | Values in {scale_name}")
-
-                # Section 5: Summary Statistics
-                st.markdown("### Summary: Key Valuation Metrics")
-
-                summary_display = df_stats.copy()
-                summary_display.index = summary_display.index.strftime('%Y-%m-%d')
-
-                # Format different columns appropriately
-                format_dict = {
-                    'Revenue Growth': '{:.2%}',
-                    'EBIT Growth': '{:.2%}',
-                    'Gross Margin': '{:.2%}',
-                    'EBIT Margin': '{:.2%}',
-                    'Eff Tax Rate': '{:.2%}',
-                    'NOPAT': '{:,.0f}',
-                    'Reinvestment': '{:,.0f}',
-                    'Reinv Rate': '{:.2%}'
-                }
-
-                # Scale NOPAT and Reinvestment for display
-                summary_display['NOPAT'] = summary_display['NOPAT'] / scale_factor
-                summary_display['Reinvestment'] = summary_display['Reinvestment'] / scale_factor
-
-                st.dataframe(summary_display.style.format(format_dict), use_container_width=True)
-                st.caption(f"NOPAT and Reinvestment in {scale_name}")
-
-                # Averages for quick reference
-                st.markdown("### Historical Averages & Latest Run-rate (for projections)")
-
+                st.markdown("### What Carries Into the DCF")
                 avg_col1, avg_col2, avg_col3, avg_col4 = st.columns(4)
-
+                latest = lambda column: df_stats[column].dropna().iloc[-1] if not df_stats[column].dropna().empty else np.nan
                 with avg_col1:
-                    avg_rev_growth = _average_revenue_growth(df_stats['Revenue Growth'])
-                    latest_rev_growth = df_stats['Revenue Growth'].dropna().iloc[-1] if not df_stats['Revenue Growth'].dropna().empty else avg_rev_growth
-                    st.metric(
-                        "Avg Revenue Growth",
-                        f"{avg_rev_growth:.2%}",
-                        help="Multi-year historical average revenue growth"
-                    )
-                    st.caption(f"**Latest Run-Rate (2026):** {latest_rev_growth:.2%}")
-
+                    st.metric("Latest Revenue Growth", f"{latest('Revenue Growth'):.1%}",
+                              help="Year-1 growth uses analyst consensus when available")
+                    st.caption(f"Multi-year average: {_average_revenue_growth(df_stats['Revenue Growth']):.1%}")
                 with avg_col2:
-                    avg_ebit_margin = _average_dampening_giant_outliers_only(df_stats['EBIT Margin'])
-                    latest_ebit_margin = df_stats['EBIT Margin'].dropna().iloc[-1] if not df_stats['EBIT Margin'].dropna().empty else avg_ebit_margin
-                    st.metric("Avg EBIT Margin", f"{avg_ebit_margin:.2%}")
-                    st.caption(f"**Latest Run-Rate (2026):** {latest_ebit_margin:.2%}")
-
+                    st.metric("Latest EBIT Margin", f"{latest('EBIT Margin'):.1%}")
+                    st.caption(f"Multi-year average: {_average_dampening_giant_outliers_only(df_stats['EBIT Margin']):.1%}")
                 with avg_col3:
-                    avg_tax_rate = df_stats['Eff Tax Rate'].mean()
-                    latest_tax_rate = df_stats['Eff Tax Rate'].dropna().iloc[-1] if not df_stats['Eff Tax Rate'].dropna().empty else avg_tax_rate
-                    st.metric("Avg Eff Tax Rate", f"{avg_tax_rate:.2%}")
-                    st.caption(f"**Latest (2026):** {latest_tax_rate:.2%}")
-
+                    st.metric("Return on Capital", f"{_recency_weighted_average(df_stats['Return on Capital'].dropna()):.1%}",
+                              help="Recency-weighted; anchors the terminal return on new capital")
                 with avg_col4:
-                    avg_reinv_rate = _average_historical_reinvestment_rate(df_stats)
-                    latest_reinv_rate = df_stats['Reinv Rate'].dropna().iloc[-1] if not df_stats['Reinv Rate'].dropna().empty else avg_reinv_rate
-                    st.metric("Avg Reinv Rate", f"{avg_reinv_rate:.2%}")
-                    st.caption(f"**Latest Run-Rate (2026):** {latest_reinv_rate:.2%}")
+                    st.metric("Sales-to-Capital", f"{_recency_weighted_average(df_stats['Sales to Capital'].dropna()):.2f}x",
+                              help="Recency-weighted; sets growth-linked reinvestment in the DCF")
 
             except Exception as e:
                 st.error(f"Error: {str(e)}")
@@ -2222,16 +2269,26 @@ def render_historical():
 # Page: DCF Model
 # ============================================================================
 
+def kpi_card(label, value, note=""):
+    note_html = f"<p>{note}</p>" if note else ""
+    return f"<div class='stat-card'><div class='label'>{label}</div><div class='value'>{value}</div>{note_html}</div>"
+
+
+# Consensus growth above this is faded from year 1 rather than held.
+HOLD_GROWTH_CEILING = 0.20
+
+REINVESTMENT_METHODS = {
+    "Growth-linked (sales-to-capital)": "linked",
+    "Manual reinvestment rates": "manual",
+}
+
+
 def render_dcf():
     st.header("DCF Model")
-    st.markdown("Build the discounted cash flow valuation model to derive an implied share price.")
     st.caption(
-        "This is a free-cash-flow-to-firm model, not a dividend discount model. "
-        "The long-term growth input is the perpetual rate after the explicit projection period."
+        "Free-cash-flow-to-firm valuation. Growth starts from analyst consensus, reinvestment is tied to the "
+        "growth it funds, and the result is checked against an exit multiple, the market-implied growth, and scenarios."
     )
-
-    # === Section 1: Basic Inputs ===
-    st.markdown("### Company & Valuation Inputs")
 
     if "dcf_wacc_rate" not in st.session_state:
         st.session_state["dcf_wacc_rate"] = 9.0
@@ -2241,13 +2298,11 @@ def render_dcf():
     ticker_symbol = st.session_state.get("shared_ticker_symbol", "MSFT").strip().upper()
     risk_free_rate = st.session_state.get("wacc_risk_free_rate", 4.5) / 100
 
-    col1, col2, col3 = st.columns(3)
-
     if (
         st.session_state.get("dcf_tax_ticker") != ticker_symbol
         or st.session_state.get("dcf_projection_refresh_needed", False)
     ):
-        with st.spinner(f"Loading tax rate for {ticker_symbol}..."):
+        with st.spinner(f"Loading assumptions for {ticker_symbol}..."):
             st.session_state["dcf_effective_tax_rate"] = get_effective_tax_rate(ticker_symbol) * 100
             saved_historical_data = st.session_state.get("historical_analysis_data")
             saved_historical_ticker = st.session_state.get("historical_analysis_ticker")
@@ -2272,9 +2327,7 @@ def render_dcf():
                         ticker_symbol, risk_free_rate, forward_growth, wacc_for_defaults
                     )
             except Exception as error:
-                st.error(
-                    f"Could not load historical projection assumptions for {ticker_symbol}: {error}"
-                )
+                st.error(f"Could not load historical projection assumptions for {ticker_symbol}: {error}")
                 return
             fallback_columns = projection_defaults.get('_fallback_columns', [])
             if fallback_columns:
@@ -2294,6 +2347,14 @@ def render_dcf():
                 else:
                     st.session_state[key] = f"{val * 100:.2f}"
             st.session_state["dcf_growth_source"] = projection_defaults.get('_growth_source', 'placeholder')
+            st.session_state["dcf_sales_to_capital"] = round(projection_defaults['Sales to Capital'], 2)
+            st.session_state["dcf_da_ratio"] = projection_defaults['D&A % Revenue']
+            # Hold consensus growth for three years (roughly analysts'
+            # coverage) when it's moderate; hyper-growth fades at once, since
+            # the fastest growers mean-revert fastest.
+            st.session_state["dcf_hold_years"] = (
+                3 if forward_growth is not None and forward_growth <= HOLD_GROWTH_CEILING else 1
+            )
 
             st.session_state["dcf_ronic_mode"] = next(iter(RONIC_MODES))
             historical_roc = projection_defaults.get('Historical ROC')
@@ -2307,389 +2368,359 @@ def render_dcf():
             if st.session_state.get("wacc_terminal_growth_ticker") == ticker_symbol:
                 st.session_state["dcf_terminal_growth_rate"] = st.session_state["wacc_terminal_growth_rate"] * 100
             else:
-                st.session_state["dcf_terminal_growth_rate"] = max(risk_free_rate, 0.0) * 100
+                st.session_state["dcf_terminal_growth_rate"] = default_stable_growth(risk_free_rate) * 100
         st.session_state["dcf_tax_ticker"] = ticker_symbol
         st.session_state["dcf_projection_refresh_needed"] = False
+        st.session_state.pop("dcf_run_ticker", None)
 
-    with col2:
+    # === Inputs ===
+    st.markdown(f"### Assumptions · {ticker_symbol}")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
         wacc = st.number_input(
-            "WACC (%)",
-            min_value=1.0, max_value=30.0, step=0.25, key="dcf_wacc_rate",
-            help="From WACC Calculator tab"
+            "WACC (%)", min_value=1.0, max_value=30.0, step=0.25, key="dcf_wacc_rate",
+            help="Loaded from the WACC Calculator tab"
         ) / 100
-
-    with col3:
+    with col2:
         terminal_growth = st.number_input(
-            "Long-Term Growth Rate (%)",
-            step=0.25, key="dcf_terminal_growth_rate",
-            help="Perpetual growth assumption after the explicit forecast. It must be below WACC; rates above the risk-free rate are economically aggressive and should be justified."
+            "Perpetual Growth (%)", step=0.25, key="dcf_terminal_growth_rate",
+            help="Growth after the forecast, forever. Defaults to the lower of the risk-free rate and 3% "
+                 "(long-run nominal GDP) and must stay below WACC."
         ) / 100
-    if terminal_growth >= wacc:
-        st.error(
-            "Perpetual growth must be below WACC. The Gordon Growth terminal value is not finite otherwise."
-        )
-        return
-    if terminal_growth > risk_free_rate:
-        st.warning(
-            f"Long-term growth ({terminal_growth:.2%}) exceeds the risk-free-rate proxy "
-            f"({risk_free_rate:.2%}) for nominal economic growth. This perpetual assumption requires strong justification."
-        )
-
-    col4, col5 = st.columns(2)
-
-    with col4:
+    with col3:
         eff_tax_rate = st.number_input(
-            "Effective Tax Rate (%)",
-            min_value=0.0, max_value=50.0, step=1.0, key="dcf_effective_tax_rate",
-            help="Auto-populated from the same ticker tax-rate resolver used by the WACC tab"
+            "Effective Tax Rate (%)", min_value=0.0, max_value=50.0, step=1.0, key="dcf_effective_tax_rate",
         ) / 100
-
-    with col5:
+    with col4:
         scale_options = {"Millions ($M)": 1_000_000, "Billions ($B)": 1_000_000_000}
         scale_choice = st.selectbox("Display Scale", options=list(scale_options.keys()), key="dcf_scale")
         scale_factor = scale_options[scale_choice]
         scale_name = "$M" if scale_factor == 1_000_000 else "$B"
 
-    # === Section 2: Projection Assumptions ===
-    st.markdown("### Projection Assumptions")
-    horizon_mode = st.selectbox(
-        "Projection Horizon",
-        options=["1 year", "5 years", "10 years", "Custom comma-separated"],
-        index=2,
-        key="dcf_horizon_mode",
-        help="Fixed horizons repeat one assumption. Custom mode uses one value per comma-separated year.",
-    )
-    st.caption(
-        "Auto-filled when available. One value holds constant; two values transition from year 1 to the "
-        "final forecast year (revenue growth and reinvestment fade front-loaded, margins linearly); "
-        "Custom mode accepts one assumption per year."
-    )
-    st.caption(
-        f"Year-1 revenue growth source: {st.session_state.get('dcf_growth_source', 'placeholder')}. "
-        "It converges to the long-term growth rate by the final year."
-    )
+    if terminal_growth >= wacc:
+        st.error("Perpetual growth must be below WACC; otherwise the terminal value is infinite.")
+        return
+    if terminal_growth > default_stable_growth(risk_free_rate) + 0.0001:
+        st.warning(
+            f"Perpetual growth ({terminal_growth:.2%}) is above the {default_stable_growth(risk_free_rate):.2%} default "
+            "(the lower of the risk-free rate and long-run nominal GDP). No company outgrows the economy forever."
+        )
 
-    col_a, col_b, col_c = st.columns(3)
-
-    with col_a:
+    col_h, col_g, col_m = st.columns(3)
+    with col_h:
+        horizon_mode = st.selectbox(
+            "Forecast Horizon", options=["10 years", "5 years", "Custom comma-separated"], key="dcf_horizon_mode",
+        )
+    with col_g:
         growth_input = st.text_input(
-            "Revenue Growth Rates (%)",
-            key="dcf_growth_input",
-            help="Two values: year-1 growth, then final-year growth. The gap closes ~25% per year "
-                 "(empirical mean reversion of growth), so it reaches the final value in the last year."
+            "Revenue Growth (%) · year 1, final year", key="dcf_growth_input",
+            help="Year-1 growth is held for the high-growth years, then fades toward the final value."
         )
-
-    with col_b:
+    with col_m:
         margin_input = st.text_input(
-            "EBIT Margins (%)",
-            key="dcf_margin_input",
-            help="One value repeats; two values linearly transition from the first to final forecast year"
+            "EBIT Margin (%) · year 1, final year", key="dcf_margin_input",
+            help="Moves linearly from year 1 to the final year. Set the final margin where the business is "
+                 "heading, not its 10-year average."
         )
+    st.caption(f"Year-1 growth source: {st.session_state.get('dcf_growth_source', 'placeholder')}.")
 
-    with col_c:
-        reinv_input = st.text_input(
-            "Reinvestment Rates (%)",
-            key="dcf_reinvestment_input",
-            help="Pre-filled: first value = reinvestment / NOPAT over the last three years; second value = "
-                 "the stable rate the terminal value needs (long-term growth / terminal return on new capital). "
-                 "Two values fade front-loaded like revenue growth, so a temporary capex cycle isn't extrapolated."
+    col_hold, col_rm, col_s2c = st.columns(3)
+    with col_hold:
+        hold_years = st.number_input(
+            "High-Growth Years", min_value=1, max_value=10, step=1, key="dcf_hold_years",
+            help="Years that keep year-1 growth before fading (stage 1 of a 3-stage model). "
+                 "1 = start fading immediately."
         )
+    with col_rm:
+        reinvestment_method = st.selectbox(
+            "Reinvestment Method", options=list(REINVESTMENT_METHODS), key="dcf_reinvestment_method",
+            help="Growth-linked: reinvestment = change in revenue ÷ sales-to-capital, so today's growth capex is "
+                 "paired with the revenue it produces. Manual: % of NOPAT, e.g. to model a capex cycle explicitly."
+        )
+    linked = REINVESTMENT_METHODS[reinvestment_method] == "linked"
+    with col_s2c:
+        if linked:
+            sales_to_capital = st.number_input(
+                "Sales-to-Capital", min_value=0.1, max_value=20.0, step=0.1, key="dcf_sales_to_capital",
+                help="Revenue each $1 of new capital produces. Default: the company's recency-weighted history. "
+                     "Lower it if the current capex wave will earn less than past investment."
+            )
+            reinv_input = None
+        else:
+            sales_to_capital = None
+            reinv_input = st.text_input(
+                "Reinvestment (% of NOPAT) · year 1, final year", key="dcf_reinvestment_input",
+                help="Net reinvestment = capex − D&A (maintenance) + change in working capital, as % of NOPAT."
+            )
 
     historical_roc = st.session_state.get("dcf_historical_roc")
-    col_e, _ = st.columns(2)
-    with col_e:
-        ronic_mode = st.selectbox(
-            "Terminal Return on New Capital",
-            options=list(RONIC_MODES),
-            key="dcf_ronic_mode",
-            help="Return earned on capital invested after the forecast; sets terminal reinvestment = g / RONIC. "
-                 "Excess returns usually fade but persist for strong franchises (McKinsey ROIC-persistence data), "
-                 "so the default meets halfway between today's return and WACC.",
-        )
-        terminal_ronic_input = st.number_input(
-            "Custom Terminal Return on New Capital (%)",
-            min_value=0.5, max_value=200.0, step=0.5, key="dcf_terminal_ronic",
-            disabled=RONIC_MODES[ronic_mode] != "custom",
-        ) / 100
+    with st.expander("Terminal return, exit multiple & scenarios"):
+        col_r1, col_r2 = st.columns(2)
+        with col_r1:
+            ronic_mode = st.selectbox(
+                "Terminal Return on New Capital", options=list(RONIC_MODES), key="dcf_ronic_mode",
+                help="Sets terminal reinvestment = g ÷ RONIC. Excess returns usually fade but persist for strong "
+                     "franchises, so the default sits halfway between today's return and WACC.",
+            )
+            terminal_ronic_input = st.number_input(
+                "Custom Return on New Capital (%)", min_value=0.5, max_value=200.0, step=0.5,
+                key="dcf_terminal_ronic", disabled=RONIC_MODES[ronic_mode] != "custom",
+            ) / 100
+        with col_r2:
+            exit_multiple_input = st.number_input(
+                "Exit EV/EBITDA (0 = company's current multiple)", min_value=0.0, max_value=100.0, step=0.5,
+                value=0.0, key="dcf_exit_multiple",
+            )
+        col_s1, col_s2, col_s3 = st.columns(3)
+        with col_s1:
+            scenario_growth = st.number_input(
+                "Scenario Growth Swing (± pts)", min_value=0.0, max_value=30.0, value=3.0, step=0.5,
+                key="dcf_scenario_growth",
+            ) / 100
+        with col_s2:
+            scenario_margin = st.number_input(
+                "Scenario Margin Swing (± pts)", min_value=0.0, max_value=30.0, value=2.0, step=0.5,
+                key="dcf_scenario_margin",
+            ) / 100
+        with col_s3:
+            bear_weight = st.number_input(
+                "Bear / Bull Weight (%)", min_value=0.0, max_value=50.0, value=25.0, step=5.0,
+                key="dcf_scenario_weight", help="Base case gets the remainder.",
+            ) / 100
 
     def terminal_ronic_for(discount_rate):
         return resolve_terminal_ronic(RONIC_MODES[ronic_mode], discount_rate, historical_roc, terminal_ronic_input)
 
-    terminal_ronic = terminal_ronic_for(wacc)
-    if historical_roc:
-        st.caption(
-            f"Historical return on capital (recency-weighted): {historical_roc:.1%}. "
-            f"Terminal return on new capital used: {terminal_ronic:.1%}."
-        )
-
-    # Parse inputs
     try:
-        if horizon_mode == "Custom comma-separated":
-            growth_rates = expand_projection_input(growth_input, "Revenue growth rates")
-            ebit_margins = expand_projection_input(margin_input, "EBIT margins")
-            reinv_rates = expand_projection_input(reinv_input, "Reinvestment rates")
-            if not (len(growth_rates) == len(ebit_margins) == len(reinv_rates)):
-                st.error("Custom projection inputs must contain the same number of yearly values.")
-                return
-            time_horizon = len(growth_rates)
-        else:
-            time_horizon = int(horizon_mode.split()[0])
-            growth_rates = expand_projection_input(growth_input, "Revenue growth rates", time_horizon, converge=True)
-            ebit_margins = expand_projection_input(margin_input, "EBIT margins", time_horizon)
-            reinv_rates = expand_projection_input(reinv_input, "Reinvestment rates", time_horizon, converge=True)
-
-        if time_horizon == 1:
-            st.warning("A one-year DCF treats that year's FCF as perpetual; use it as a quick scenario, not a normalized valuation.")
-        st.caption(f"Projection period: {time_horizon} years")
-
-    except ValueError:
-        st.error("Please enter valid comma-separated numbers for all projection inputs.")
+        growth_values = expand_projection_input(growth_input, "Revenue growth")
+        margin_values = expand_projection_input(margin_input, "EBIT margins")
+        reinv_values = expand_projection_input(reinv_input, "Reinvestment rates") if not linked else None
+    except ValueError as error:
+        st.error(str(error))
         return
 
-    # === Run Valuation Button ===
-    run_dcf = st.button("Run DCF Valuation", type="primary")
+    if horizon_mode == "Custom comma-separated":
+        time_horizon = len(growth_values)
+        if len(margin_values) not in (1, time_horizon) or (reinv_values and len(reinv_values) not in (1, time_horizon)):
+            st.error("Custom mode needs one value per year in every input (or a single value to repeat).")
+            return
+    else:
+        time_horizon = int(horizon_mode.split()[0])
+        if len(growth_values) > 2 or len(margin_values) > 2 or (reinv_values and len(reinv_values) > 2):
+            st.error("Enter one or two values per input, or switch to Custom comma-separated.")
+            return
+    try:
+        ebit_margins = expand_projection_input(margin_input, "EBIT margins", time_horizon)
+        reinv_rates = (
+            expand_projection_input(reinv_input, "Reinvestment rates", time_horizon, converge=True)
+            if not linked else None
+        )
+    except ValueError as error:
+        st.error(str(error))
+        return
 
-    if run_dcf:
-        with st.spinner(f"Running DCF valuation for {ticker_symbol}..."):
-            try:
-                # Get company data
-                company_data = get_company_market_data(ticker_symbol)
-                company_name = company_data["company_name"]
-                shares_outstanding = company_data["diluted_shares_outstanding"]
-                total_debt = company_data["total_debt"]
-                total_cash = company_data["total_cash"]
-                non_operating_assets = company_data["non_operating_assets"]
-                minority_interest = company_data["minority_interest"]
-                current_price = company_data["current_price"]
-                fx_rate = company_data["fx_rate"]
+    if st.button("Run DCF Valuation", type="primary"):
+        st.session_state["dcf_run_ticker"] = ticker_symbol
+    if st.session_state.get("dcf_run_ticker") != ticker_symbol:
+        return
 
-                # Get LTM Revenue
-                ltm_revenue, most_recent_date = get_ltm_revenue(ticker_symbol)
+    try:
+        company_data = get_company_market_data(ticker_symbol)
+        ltm_revenue, most_recent_date = get_ltm_revenue(ticker_symbol)
+    except Exception as error:
+        st.error(f"Error: {error}")
+        st.info("Please check that the ticker symbol is valid and has sufficient financial data.")
+        return
 
-                st.subheader(f"{company_name} ({ticker_symbol})")
-                if company_data["financial_currency"] != company_data["price_currency"]:
-                    st.info(
-                        f"Financial statements are in {company_data['financial_currency']}; amounts below are in "
-                        f"{company_data['financial_currency']}. The implied share price is converted to "
-                        f"{company_data['price_currency']} at {fx_rate:.4f}."
-                    )
+    current_price = company_data["current_price"]
+    case = {
+        'ltm_revenue': ltm_revenue,
+        'ltm_date': most_recent_date,
+        'growth_values': growth_values,
+        'horizon': time_horizon,
+        'hold_years': hold_years,
+        'ebit_margins': ebit_margins,
+        'reinv_rates': reinv_rates,
+        'sales_to_capital': sales_to_capital,
+        'tax_rate': eff_tax_rate,
+        'total_debt': company_data["total_debt"],
+        'total_cash': company_data["total_cash"],
+        'non_operating_assets': company_data["non_operating_assets"],
+        'minority_interest': company_data["minority_interest"],
+        'shares': company_data["diluted_shares_outstanding"],
+        'fx_rate': company_data["fx_rate"],
+        'da_ratio': st.session_state.get("dcf_da_ratio", 0.0),
+    }
 
-                # Display starting data
-                st.markdown("### Starting Point: LTM Data")
-                col_ltm1, col_ltm2, col_ltm3 = st.columns(3)
-                with col_ltm1:
-                    st.metric("LTM Revenue", f"{ltm_revenue/scale_factor:,.2f} {scale_name}")
-                with col_ltm2:
-                    st.metric("Most Recent Quarter", most_recent_date.strftime('%Y-%m-%d'))
-                with col_ltm3:
-                    st.metric("Diluted Shares", f"{shares_outstanding/1e6:,.2f}M")
+    try:
+        terminal_ronic = terminal_ronic_for(wacc)
+        terminal_reinv = get_terminal_reinvestment_rate(terminal_growth, terminal_ronic)
+        valuation = run_dcf_case(case, wacc, terminal_growth, terminal_reinv)
+        weights = {"Bear": bear_weight, "Base": 1 - 2 * bear_weight, "Bull": bear_weight}
+        scenarios = {
+            name: run_dcf_case(case, wacc, terminal_growth, terminal_reinv, sign * scenario_growth, sign * scenario_margin)
+            for name, sign in (("Bear", -1), ("Base", 0), ("Bull", 1))
+        }
+        implied_growth = solve_implied_growth(case, wacc, terminal_growth, terminal_reinv, current_price)
+    except ValueError as error:
+        st.error(str(error))
+        return
 
-                # Build projections
-                projections = build_dcf_projections(
-                    ltm_revenue, most_recent_date,
-                    growth_rates, ebit_margins, reinv_rates, eff_tax_rate
-                )
+    projections = valuation['projections']
+    implied_price = valuation['share_price']
+    weighted_price = sum(weights[name] * scenarios[name]['share_price'] for name in scenarios)
+    upside = (implied_price - current_price) / current_price
 
-                # Calculate valuation
-                terminal_reinv = get_terminal_reinvestment_rate(terminal_growth, terminal_ronic)
-                if terminal_reinv > 1:
-                    st.warning(
-                        "The terminal reinvestment rate exceeds 100% of NOPAT, implying negative "
-                        "terminal free cash flow. Review the stable growth and return-on-capital assumptions."
-                    )
+    # === Results ===
+    st.divider()
+    st.subheader(f"{company_data['company_name']} ({ticker_symbol})")
+    st.caption(
+        f"LTM revenue {ltm_revenue / scale_factor:,.1f} {scale_name} through {most_recent_date:%b %Y} · "
+        f"{case['shares'] / 1e6:,.1f}M diluted shares"
+        + (f" · {company_data['sector']} / {company_data['industry']}" if company_data['sector'] else "")
+    )
+    fit = get_model_fit_warning(company_data['sector'], company_data['industry'])
+    if fit:
+        st.warning(f"**DCF is a weak fit here.** {fit[0]} Use {fit[1]} as the primary method and this DCF as a cross-check.")
+    if company_data["financial_currency"] != company_data["price_currency"]:
+        st.info(
+            f"Statements are in {company_data['financial_currency']}; the share price is converted to "
+            f"{company_data['price_currency']} at {case['fx_rate']:.4f}."
+        )
+    if terminal_reinv > 1:
+        st.warning("Terminal reinvestment exceeds 100% of NOPAT (negative terminal cash flow). Review growth and return on capital.")
 
-                valuation = calculate_dcf_valuation(
-                    projections, wacc, terminal_growth,
-                    total_debt, total_cash, shares_outstanding,
-                    terminal_reinvestment_rate=terminal_reinv,
-                    non_operating_assets=non_operating_assets,
-                    minority_interest=minority_interest,
-                    fx_rate=fx_rate,
-                )
+    k1, k2, k3, k4 = st.columns(4)
+    k1.markdown(kpi_card("Implied Price", f"${implied_price:,.2f}", "Base case"), unsafe_allow_html=True)
+    k2.markdown(kpi_card("Market Price", f"${current_price:,.2f}"), unsafe_allow_html=True)
+    color = "var(--teal)" if upside >= 0 else "var(--coral)"
+    k3.markdown(kpi_card("Upside / Downside", f"<span style='color:{color}'>{upside:+.1%}</span>"), unsafe_allow_html=True)
+    k4.markdown(kpi_card("Scenario-Weighted", f"${weighted_price:,.2f}",
+                         f"{weights['Bear']:.0%} bear / {weights['Base']:.0%} base / {weights['Bull']:.0%} bull"),
+                unsafe_allow_html=True)
+    st.markdown("<div style='height: .75rem'></div>", unsafe_allow_html=True)
 
-                # === Display Projections ===
-                st.markdown("### Projected Financials")
+    tab_proj, tab_bridge, tab_checks, tab_sens = st.tabs(
+        ["Projections", "Value Bridge", "Cross-Checks", "Sensitivity & Scenarios"]
+    )
 
-                # Assumptions table
-                st.markdown("**Assumptions by Year**")
-                assumptions_df = projections[['Revenue Growth', 'EBIT Margin', 'Reinv Rate']].copy()
-                assumptions_df.index = assumptions_df.index.strftime('%Y')
-                st.dataframe(
-                    assumptions_df.style.format("{:.1%}"),
-                    use_container_width=True
-                )
+    with tab_proj:
+        table = projections[['Revenue Growth', 'EBIT Margin', 'Revenue', 'EBIT', 'NOPAT', 'Reinvestment',
+                             'Reinv Rate', 'FCF', 'Discounted_FCF']].copy()
+        table.index = table.index.strftime('%Y')
+        for column in ('Revenue', 'EBIT', 'NOPAT', 'Reinvestment', 'FCF', 'Discounted_FCF'):
+            table[column] = table[column] / scale_factor
+        table = table.rename(columns={'Reinv Rate': 'Reinv % NOPAT', 'Discounted_FCF': 'PV of FCF'}).T
+        percent_rows = ['Revenue Growth', 'EBIT Margin', 'Reinv % NOPAT']
+        st.dataframe(
+            table.style.format("{:.1%}", subset=pd.IndexSlice[percent_rows, :])
+                 .format("{:,.1f}", subset=pd.IndexSlice[[r for r in table.index if r not in percent_rows], :]),
+            width="stretch",
+        )
+        method_note = (
+            f"Reinvestment = Δ revenue ÷ sales-to-capital {sales_to_capital:.2f}" if linked
+            else "Reinvestment = NOPAT × manual rate"
+        )
+        st.caption(f"{scale_name} · {method_note} · FCF = NOPAT − reinvestment · mid-year discounting.")
 
-                # Dollar projections table
-                st.markdown("**Projected Values**")
-                dollar_cols = ['Revenue', 'EBIT', 'NOPAT', 'FCF', 'Discounted_FCF']
-                dollar_df = valuation['projections'][dollar_cols].copy() / scale_factor
-                dollar_df.index = dollar_df.index.strftime('%Y')
-                st.dataframe(
-                    dollar_df.style.format("{:,.2f}"),
-                    use_container_width=True
-                )
-                st.caption(f"Values in {scale_name}")
+    with tab_bridge:
+        tv_share = (valuation['pv_terminal'] / valuation['enterprise_value']
+                    if valuation['enterprise_value'] > 0 else np.nan)
+        bridge = pd.DataFrame({
+            "Item": ["PV of forecast FCF", "PV of terminal value", "Enterprise value", "Less: debt", "Plus: cash",
+                     "Plus: non-operating investments", "Less: minority interest", "Equity value",
+                     "÷ Diluted shares", "Implied share price"],
+            "Value": [
+                f"{valuation['pv_fcf'] / scale_factor:,.1f} {scale_name}",
+                f"{valuation['pv_terminal'] / scale_factor:,.1f} {scale_name}",
+                f"{valuation['enterprise_value'] / scale_factor:,.1f} {scale_name}",
+                f"({case['total_debt'] / scale_factor:,.1f}) {scale_name}",
+                f"{case['total_cash'] / scale_factor:,.1f} {scale_name}",
+                f"{case['non_operating_assets'] / scale_factor:,.1f} {scale_name}",
+                f"({case['minority_interest'] / scale_factor:,.1f}) {scale_name}",
+                f"{valuation['equity_value'] / scale_factor:,.1f} {scale_name}",
+                f"{case['shares'] / 1e6:,.1f}M",
+                f"${implied_price:,.2f}",
+            ],
+        })
+        st.table(bridge.set_index("Item"))
+        st.caption(
+            f"Terminal value = NOPAT × (1 + g) × (1 − g / RONIC) ÷ (WACC − g); terminal reinvestment "
+            f"{terminal_reinv:.1%} = g {terminal_growth:.2%} ÷ RONIC {terminal_ronic:.1%}. "
+            + (f"Terminal value is {tv_share:.0%} of enterprise value." if np.isfinite(tv_share) else "")
+        )
 
-                # === Terminal Value ===
-                st.markdown("### Terminal Value")
-
-                st.latex(r"TV = \frac{NOPAT_{final} \times (1 + g) \times (1 - g/RONIC)}{WACC - g}")
-
-                final_nopat = projections.iloc[-1]['NOPAT']
-                st.write(f"TV = ({final_nopat/scale_factor:,.2f} × (1 + {terminal_growth:.2%}) × (1 - {terminal_reinv:.2%})) / ({wacc:.2%} - {terminal_growth:.2%})")
+    with tab_checks:
+        exit_multiple = exit_multiple_input or company_data.get("ev_to_ebitda")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Exit-multiple terminal value**")
+            if exit_multiple:
+                exit_price, final_ebitda = exit_multiple_price(valuation, case, wacc, exit_multiple)
+                implied_exit = valuation['terminal_value'] / final_ebitda if final_ebitda > 0 else np.nan
+                st.markdown(kpi_card(f"Price at {exit_multiple:.1f}x EV/EBITDA", f"${exit_price:,.2f}",
+                                     f"Perpetual-growth terminal value implies {implied_exit:.1f}x final-year EBITDA."),
+                            unsafe_allow_html=True)
+                gap = exit_price / implied_price - 1 if implied_price else np.nan
                 st.caption(
-                    f"Terminal reinvestment {terminal_reinv:.2%} = g {terminal_growth:.2%} / "
-                    f"return on new capital {terminal_ronic:.2%}"
-                    + f" ({ronic_mode.lower()})."
+                    "The two terminal methods agree." if abs(gap) < 0.2 else
+                    f"The two methods differ by {gap:+.0%}. Either the market multiple prices in growth beyond "
+                    "your perpetual rate, or today's multiple won't hold."
                 )
+            else:
+                st.caption("No EV/EBITDA available; enter an exit multiple under assumptions.")
+        with c2:
+            st.markdown("**Reverse DCF: what the price implies**")
+            base_growth = growth_values[0]
+            if implied_growth is not None:
+                st.markdown(kpi_card("Market-Implied Year-1 Growth", f"{implied_growth:.1%}",
+                                     f"vs your {base_growth:.1%}, with the same hold, fade, margins and WACC."),
+                            unsafe_allow_html=True)
+                st.caption(
+                    "The market expects faster growth than you do." if implied_growth > base_growth else
+                    "The market expects slower growth than you do."
+                )
+            else:
+                st.caption("No growth rate between −50% and 150% reproduces the market price; margins or WACC drive the gap.")
 
-                col_tv1, col_tv2 = st.columns(2)
-                with col_tv1:
-                    st.metric("Terminal Value", f"{valuation['terminal_value']/scale_factor:,.2f} {scale_name}")
-                with col_tv2:
-                    st.metric("PV of Terminal Value", f"{valuation['pv_terminal']/scale_factor:,.2f} {scale_name}")
+    with tab_sens:
+        st.markdown("**Implied price: WACC × perpetual growth**")
+        wacc_steps = [wacc + step for step in (-0.01, -0.005, 0.0, 0.005, 0.01)]
+        growth_steps = [terminal_growth + step for step in (-0.005, -0.0025, 0.0, 0.0025, 0.005)]
+        grid = {}
+        for g in growth_steps:
+            column = {}
+            for w in wacc_steps:
+                if w <= 0 or g >= w:
+                    column[f"{w:.2%}"] = np.nan
+                    continue
+                reinv = get_terminal_reinvestment_rate(g, terminal_ronic_for(w))
+                column[f"{w:.2%}"] = run_dcf_case(case, w, g, reinv)['share_price']
+            grid[f"g {g:.2%}"] = column
+        grid_df = pd.DataFrame(grid)
+        grid_df.index.name = "WACC"
+        st.table(
+            grid_df.style.format("${:,.2f}", na_rep="n/a")
+                   .map(lambda price: "" if pd.isna(price) else
+                        f"background-color: {'#d7eeeb' if price >= current_price else '#fbe3dd'}")
+        )
+        st.caption(f"Teal above, coral below the market price of ${current_price:,.2f}. Center cell is the base case.")
 
-                # === Enterprise Value ===
-                st.markdown("### Enterprise Value")
+        st.markdown("**Scenarios**")
+        scenario_rows = []
+        for name, sign in (("Bear", -1), ("Base", 0), ("Bull", 1)):
+            price = scenarios[name]['share_price']
+            scenario_rows.append({
+                "Scenario": name,
+                "Weight": f"{weights[name]:.0%}",
+                "Year-1 Growth": f"{growth_values[0] + sign * scenario_growth:.1%}",
+                "Margin Shift": f"{sign * scenario_margin:+.1%}",
+                "Implied Price": f"${price:,.2f}",
+                "vs Market": f"{price / current_price - 1:+.1%}",
+            })
+        st.table(pd.DataFrame(scenario_rows).set_index("Scenario"))
+        st.caption("The bear case is your margin of safety: how far value falls if growth and margins disappoint.")
 
-                st.latex(r"EV = \sum_{t=1}^{n} \frac{FCF_t}{(1+WACC)^{t-0.5}} + \frac{TV}{(1+WACC)^{n-0.5}}")
-                st.caption("Mid-year convention: cash flows arrive through each year, not on its last day.")
-
-                col_ev1, col_ev2, col_ev3 = st.columns(3)
-                with col_ev1:
-                    st.metric("PV of FCFs", f"{valuation['pv_fcf']/scale_factor:,.2f} {scale_name}")
-                with col_ev2:
-                    st.metric("PV of Terminal Value", f"{valuation['pv_terminal']/scale_factor:,.2f} {scale_name}")
-                with col_ev3:
-                    st.metric("Enterprise Value", f"{valuation['enterprise_value']/scale_factor:,.2f} {scale_name}")
-
-                # === Equity Value & Share Price ===
-                st.markdown("### Equity Value & Implied Share Price")
-
-                st.latex(r"Equity\ Value = EV - Debt + Cash + Non\text{-}operating\ Investments - Minority\ Interest")
-                st.latex(r"Share\ Price = \frac{Equity\ Value}{Diluted\ Shares}")
-
-                col_eq1, col_eq2, col_eq3, col_eq4, col_eq5 = st.columns(5)
-                with col_eq1:
-                    st.metric("Total Debt", f"{total_debt/scale_factor:,.2f} {scale_name}")
-                with col_eq2:
-                    st.metric("Total Cash", f"{total_cash/scale_factor:,.2f} {scale_name}")
-                with col_eq3:
-                    st.metric("Non-op. Investments", f"{non_operating_assets/scale_factor:,.2f} {scale_name}")
-                with col_eq4:
-                    st.metric("Minority Interest", f"{minority_interest/scale_factor:,.2f} {scale_name}")
-                with col_eq5:
-                    st.metric("Equity Value", f"{valuation['equity_value']/scale_factor:,.2f} {scale_name}")
-
-                st.divider()
-
-                # Final share price display
-                implied_price = valuation['share_price']
-
-                col_price1, col_price2, col_price3 = st.columns(3)
-                with col_price1:
-                    st.metric("Current Market Price", f"${current_price:,.2f}")
-                with col_price2:
-                    st.markdown(f"<h1 style='text-align: center; color: #1f77b4;'>${implied_price:,.2f}</h1>", unsafe_allow_html=True)
-                    st.markdown("<p style='text-align: center;'><strong>Implied Share Price</strong></p>", unsafe_allow_html=True)
-                with col_price3:
-                    upside = (implied_price - current_price) / current_price * 100
-                    color = "green" if upside > 0 else "red"
-                    st.metric("Upside/Downside", f"{upside:+.1f}%")
-
-                # === Sensitivity Analysis ===
-                st.markdown("### Sensitivity Analysis")
-                st.caption("See how implied share price changes with different WACC assumptions")
-
-                wacc_low = st.number_input("Low WACC (%)", value=(wacc*100 - 1.5), step=0.25, key="wacc_low") / 100
-                wacc_high = st.number_input("High WACC (%)", value=(wacc*100 + 1.5), step=0.25, key="wacc_high") / 100
-
-                sensitivity_results = []
-                for w in [wacc_low, wacc, wacc_high]:
-                    if not np.isfinite(w) or w <= 0 or terminal_growth >= w:
-                        sensitivity_results.append({
-                            'WACC': f"{w:.2%}",
-                            'Enterprise Value': "N/A",
-                            'Equity Value': "N/A",
-                            'Share Price': "N/A",
-                            'vs Current': "WACC must exceed growth",
-                        })
-                        continue
-                    proj_copy = build_dcf_projections(
-                        ltm_revenue, most_recent_date,
-                        growth_rates, ebit_margins, reinv_rates, eff_tax_rate
-                    )
-                    val = calculate_dcf_valuation(
-                        proj_copy, w, terminal_growth,
-                        total_debt, total_cash, shares_outstanding,
-                        terminal_reinvestment_rate=get_terminal_reinvestment_rate(
-                            terminal_growth, terminal_ronic_for(w)
-                        ),
-                        non_operating_assets=non_operating_assets,
-                        minority_interest=minority_interest,
-                        fx_rate=fx_rate,
-                    )
-                    sensitivity_results.append({
-                        'WACC': f"{w:.2%}",
-                        'Enterprise Value': f"{val['enterprise_value']/scale_factor:,.2f}",
-                        'Equity Value': f"{val['equity_value']/scale_factor:,.2f}",
-                        'Share Price': f"${val['share_price']:,.2f}",
-                        'vs Current': f"{((val['share_price'] - current_price) / current_price * 100):+.1f}%"
-                    })
-
-                sensitivity_df = pd.DataFrame(sensitivity_results)
-                st.dataframe(sensitivity_df, use_container_width=True, hide_index=True)
-
-                # === Summary Table ===
-                st.markdown("### Valuation Summary")
-                summary_data = {
-                    "Metric": [
-                        "LTM Revenue",
-                        "Projection Period",
-                        "WACC",
-                        "Terminal Growth Rate",
-                        "Effective Tax Rate",
-                        "PV of FCFs",
-                        "Terminal Value",
-                        "PV of Terminal Value",
-                        "Enterprise Value",
-                        "Less: Total Debt",
-                        "Plus: Total Cash",
-                        "Plus: Non-operating Investments",
-                        "Less: Minority Interest",
-                        "Equity Value",
-                        "Diluted Shares",
-                        "Implied Share Price",
-                        "Current Market Price",
-                        "Upside/Downside"
-                    ],
-                    "Value": [
-                        f"{ltm_revenue/scale_factor:,.2f} {scale_name}",
-                        f"{time_horizon} years",
-                        f"{wacc:.2%}",
-                        f"{terminal_growth:.2%}",
-                        f"{eff_tax_rate:.2%}",
-                        f"{valuation['pv_fcf']/scale_factor:,.2f} {scale_name}",
-                        f"{valuation['terminal_value']/scale_factor:,.2f} {scale_name}",
-                        f"{valuation['pv_terminal']/scale_factor:,.2f} {scale_name}",
-                        f"{valuation['enterprise_value']/scale_factor:,.2f} {scale_name}",
-                        f"({total_debt/scale_factor:,.2f}) {scale_name}",
-                        f"{total_cash/scale_factor:,.2f} {scale_name}",
-                        f"{non_operating_assets/scale_factor:,.2f} {scale_name}",
-                        f"({minority_interest/scale_factor:,.2f}) {scale_name}",
-                        f"{valuation['equity_value']/scale_factor:,.2f} {scale_name}",
-                        f"{shares_outstanding/1e6:,.2f}M",
-                        f"${implied_price:,.2f}",
-                        f"${current_price:,.2f}",
-                        f"{upside:+.1f}%"
-                    ]
-                }
-                summary_df = pd.DataFrame(summary_data)
-                st.dataframe(summary_df, use_container_width=True, hide_index=True)
-
-            except Exception as e:
-                st.error(f"Error: {str(e)}")
-                st.info("Please check that the ticker symbol is valid and has sufficient financial data.")
 
 # ============================================================================
 # Main App with Tabs

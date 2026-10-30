@@ -1,0 +1,8 @@
+[theme]
+# Pin the light palette the custom CSS is designed for, so dark-mode
+# browsers don't render dark inputs and tables on the light page.
+base = "light"
+primaryColor = "#0e766e"
+backgroundColor = "#f7f7f2"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#17232b"

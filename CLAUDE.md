@@ -95,7 +95,8 @@ The original Colab notebooks are preserved as reference:
 - Cost of Equity (CAPM): k_E = r_f + β × EMRP
 - Cost of Debt: k_D = r_f + credit_spread
 - NOPAT = EBIT × (1 - Tax Rate)
-- FCF = NOPAT × (1 - Reinvestment Rate); reinvestment pre-fills from the last 3 years, fading to g / RONIC
+- FCF = NOPAT − Reinvestment; reinvestment = ΔRevenue / sales-to-capital (growth-linked, default) or NOPAT × manual rate
+- Perpetual growth default = min(risk-free rate, 3%)
 - Terminal Value = NOPAT_final × (1 + g) × (1 - g/RONIC) / (WACC - g), mid-year discounting
 - Enterprise Value = PV(FCFs) + PV(Terminal Value)
 - Equity Value = Enterprise Value - Debt + Cash + Non-operating Investments - Minority Interest
@@ -126,3 +127,12 @@ The original Colab notebooks are preserved as reference:
   - Dynamically aligned column discrepancies between SEC XBRL and Yahoo statements.
 - Historical Analysis (Tab 2) displays 2026 metrics, NWC changes, and AI infrastructure reinvestment surges.
 - DCF Model (Tab 3) automatically reflects updated 2026 historical averages for revenue growth, margins, and reinvestment rate defaults.
+
+### October 2026: Forward-looking DCF
+- Growth-linked reinvestment via sales-to-capital (replaces history-anchored reinvestment as the default)
+- Three-stage growth: hold consensus year-1 growth for N high-growth years, then fade (`build_growth_path`)
+- Perpetual growth default capped at 3% (`LONG_RUN_GROWTH_CAP`)
+- Cross-checks: exit EV/EBITDA terminal value, reverse DCF (`solve_implied_growth`), bear/base/bull scenarios, WACC × g grid
+- Sector-fit warnings (`MODEL_FIT_RULES`)
+- Historical tab trimmed to operating drivers, maintenance vs growth capex, and DCF carry-overs; WACC tab to one KPI row
+- `.streamlit/config.toml` pins the light theme
