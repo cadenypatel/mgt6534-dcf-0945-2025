@@ -742,6 +742,35 @@ def get_model_fit_warning(sector, industry):
     return None
 
 
+def compute_wacc(ticker_symbol, risk_free_rate, emrp, marginal_tax_rate, firm_rating, beta_method):
+    """WACC from market-value weights, CAPM cost of equity, and a rating-based
+    cost of debt. `beta_method` is a BETA_METHODS value."""
+    company_data = get_company_market_data(ticker_symbol)
+    market_cap = company_data["market_cap"]
+    # Debt is reported in the statement currency; market cap is in the quote currency.
+    total_debt = company_data["total_debt"] * company_data["fx_rate"]
+    w_E = market_cap / (market_cap + total_debt)
+    w_D = total_debt / (market_cap + total_debt)
+
+    raw_beta, r_squared, _, _ = calculate_beta(ticker_symbol)
+    regression_beta = adjust_beta_for_wacc(raw_beta)
+    bottom_up = get_bottom_up_beta(ticker_symbol, total_debt / market_cap, marginal_tax_rate)
+    beta, beta_note = select_beta(beta_method, regression_beta, bottom_up)
+
+    cost_of_equity = risk_free_rate + beta * emrp
+    credit_spread = get_credit_spread(firm_rating)
+    cost_of_debt = risk_free_rate + credit_spread
+    wacc = (w_E * cost_of_equity) + (w_D * cost_of_debt * (1 - marginal_tax_rate))
+    return {
+        "company_name": company_data["company_name"],
+        "market_cap": market_cap, "total_debt": total_debt, "w_E": w_E, "w_D": w_D,
+        "raw_beta": raw_beta, "r_squared": r_squared, "regression_beta": regression_beta,
+        "bottom_up": bottom_up, "beta": beta, "beta_note": beta_note,
+        "cost_of_equity": cost_of_equity, "credit_spread": credit_spread, "cost_of_debt": cost_of_debt,
+        "wacc": wacc,
+    }
+
+
 def get_wacc_input_defaults(ticker_symbol):
     """Fetch current market assumptions and ticker-specific tax-rate/rating estimates."""
     risk_free_rate = 0.045
@@ -1423,6 +1452,32 @@ def get_historical_data(ticker_symbol):
     }
 
 
+# Default-assumption rules, applied the same way to every ticker. Chosen by
+# calibrate.py: the combination with the least median bias (model value vs
+# market price) across a broad large-cap sample.
+#   sales_to_capital: 'median' (full window) | 'recency' (recency-weighted)
+#   margin:   'revert' (today -> through-cycle median) | 'legacy' (only when >2 pts apart)
+#   growth:   'fy_path' (NTM, next fiscal year, then fade) | 'ntm' (NTM, then fade)
+#   hold:     'ceiling' (hold 3 years if growth <= 20%) | 'none'
+MODEL_RULES = {
+    'sales_to_capital': 'median',
+    'margin': 'revert',
+    'growth': 'fy_path',
+    'hold': 'none',
+}
+
+# Consensus growth above this is faded from year 1 rather than held.
+HOLD_GROWTH_CEILING = 0.20
+
+
+def default_hold_years(forward_growth, rules=None):
+    rules = {**MODEL_RULES, **(rules or {})}
+    if rules['hold'] == 'ceiling' and forward_growth is not None:
+        lead_growth = forward_growth[1] if rules['growth'] == 'fy_path' and forward_growth[1] is not None else forward_growth[0]
+        return 3 if lead_growth <= HOLD_GROWTH_CEILING else 1
+    return 1
+
+
 def default_stable_growth(risk_free_rate):
     """Perpetual growth defaults to the risk-free rate, the market's proxy for
     long-run nominal growth (Damodaran)."""
@@ -1477,7 +1532,8 @@ def get_forward_revenue_growth(ticker_symbol, ltm_revenue, ltm_date):
 
     Consensus is given per fiscal year (current "0y" and next "+1y"); the NTM
     window after the LTM date overlaps both, so blend them by how much of the
-    current fiscal year is still ahead. Returns None when estimates are missing.
+    current fiscal year is still ahead. Returns (NTM growth, next-fiscal-year
+    growth over the current fiscal year), or None when estimates are missing.
     """
     try:
         ticker = yf.Ticker(ticker_symbol)
@@ -1499,7 +1555,10 @@ def get_forward_revenue_growth(ticker_symbol, ltm_revenue, ltm_date):
 
         ntm_revenue = remaining * current_fy + (1 - remaining) * next_fy
         growth = ntm_revenue / ltm_revenue - 1
-        return float(growth) if np.isfinite(growth) else None
+        year2_growth = next_fy / current_fy - 1
+        if not np.isfinite(growth):
+            return None
+        return float(growth), float(year2_growth) if np.isfinite(year2_growth) else None
     except Exception:
         return None
 
@@ -1516,8 +1575,12 @@ def _recent_reinvestment_rate(stats, periods=3):
     return float(recent['Reinvestment'].sum() / recent['NOPAT'].sum())
 
 
-def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, forward_growth=None, wacc=None):
+def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, forward_growth=None, wacc=None,
+                                      rules=None):
     """Return projection assumptions from saved analysis data.
+
+    `forward_growth` is (next-twelve-months growth, next-fiscal-year growth or
+    None). `rules` overrides MODEL_RULES (used by calibrate.py).
 
     Revenue growth starts at the consensus NTM growth (or the latest actual
     year) and converges to stable growth (the risk-free rate) by the final
@@ -1530,6 +1593,7 @@ def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, for
         'EBIT Margin': 0.30,
         'Reinv Rate': 0.25,
     }
+    rules = {**MODEL_RULES, **(rules or {})}
     stats = historical_data['df_stats'].replace([np.inf, -np.inf], np.nan)
     income_statement = historical_data.get('income_statement', pd.DataFrame())
     stable_growth = default_stable_growth(risk_free_rate)
@@ -1541,8 +1605,13 @@ def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, for
     for column, fallback in fallback_values.items():
         values = stats[column].dropna()
         if column == 'Revenue Growth' and forward_growth is not None:
-            defaults[column] = (float(forward_growth), stable_growth)
-            defaults['_growth_source'] = 'analyst consensus (next twelve months)'
+            ntm_growth, year2_growth = forward_growth
+            if rules['growth'] == 'fy_path' and year2_growth is not None:
+                defaults[column] = (float(ntm_growth), float(year2_growth), stable_growth)
+                defaults['_growth_source'] = 'analyst consensus (next twelve months, then next fiscal year)'
+            else:
+                defaults[column] = (float(ntm_growth), stable_growth)
+                defaults['_growth_source'] = 'analyst consensus (next twelve months)'
         elif values.empty:
             defaults[column] = fallback
             fallback_columns.append(column)
@@ -1561,6 +1630,10 @@ def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, for
         elif column == 'Revenue Growth':
             defaults[column] = (float(values.iloc[-1]), stable_growth)
             defaults['_growth_source'] = f"latest reported year ({values.index[-1]:%b %Y})"
+        elif rules['margin'] == 'revert' and len(values) >= 2:
+            # Start at today's margin and revert to the through-cycle median,
+            # up from a trough or down from a peak.
+            defaults[column] = (float(values.iloc[-1]), float(values.median()))
         else:
             hist_avg = _average_dampening_giant_outliers_only(values)
             recent_val = float(values.iloc[-1])
@@ -1583,15 +1656,13 @@ def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, for
 
     # Sales-to-capital links growth to the capital needed to fund it
     # (Damodaran): reinvestment = change in revenue / sales-to-capital.
-    # Take the better of recent and full-window history: right after a capex
-    # cycle (new fabs, plants, data centers) capital is in place before the
-    # revenue it will carry, so the recent ratio understates how cheaply
-    # future growth can be funded.
     sales_to_capital_history = stats['Sales to Capital'].dropna()
-    sales_to_capital = float(np.fmax(
-        _recency_weighted_average(sales_to_capital_history),
-        _average_dampening_giant_outliers_only(sales_to_capital_history),
-    ))
+    if rules['sales_to_capital'] == 'median':
+        # Full-window median: neutral through an investment cycle, neither
+        # anchoring on a capex-heavy recent year nor on a peak-efficiency one.
+        sales_to_capital = float(sales_to_capital_history.median()) if not sales_to_capital_history.empty else np.nan
+    else:
+        sales_to_capital = _recency_weighted_average(sales_to_capital_history)
     defaults['Sales to Capital'] = (
         float(np.clip(sales_to_capital, 0.25, 15.0)) if np.isfinite(sales_to_capital) else 1.5
     )
@@ -1617,10 +1688,10 @@ def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, for
     return defaults
 
 
-def get_projection_defaults(ticker_symbol, risk_free_rate=0.045, forward_growth=None, wacc=None):
+def get_projection_defaults(ticker_symbol, risk_free_rate=0.045, forward_growth=None, wacc=None, rules=None):
     """Fetch and return projection assumptions for a ticker."""
     return get_projection_defaults_from_data(
-        get_historical_data(ticker_symbol), risk_free_rate, forward_growth, wacc
+        get_historical_data(ticker_symbol), risk_free_rate, forward_growth, wacc, rules
     )
 
 
@@ -1669,16 +1740,20 @@ def expand_projection_input(raw_value, label, horizon=None, converge=False):
 
 
 def build_growth_path(values, horizon, hold_years=1, shift=0.0):
-    """Three-stage revenue growth: hold year-1 growth (plus `shift`) for
-    `hold_years`, then fade front-loaded to the final value. One value holds
-    constant; a full list of yearly values is shifted as-is."""
+    """Three-stage revenue growth. Two values: hold year-1 growth (plus
+    `shift`) for `hold_years`, then fade front-loaded to the final value.
+    Three values (year 1, year 2, final): year 1, then year-2 growth held for
+    `hold_years` and faded. One value holds constant; a full list of yearly
+    values is shifted as-is."""
     if len(values) == horizon and horizon >= 2:
         return [value + shift for value in values]
     if len(values) == 1:
         return [values[0] + shift] * horizon
-    start, end = values[0] + shift, values[-1]
-    hold_years = int(np.clip(hold_years, 1, horizon))
-    return [start] * (hold_years - 1) + _converging_path(start, end, horizon - hold_years + 1)
+    lead = [values[0] + shift] if len(values) == 3 else []
+    start, end = values[-2] + shift, values[-1]
+    remaining = horizon - len(lead)
+    hold_years = int(np.clip(hold_years, 1, remaining))
+    return lead + [start] * (hold_years - 1) + _converging_path(start, end, remaining - hold_years + 1)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -2075,34 +2150,18 @@ def render_wacc():
     if calculate_button:
         with st.spinner(f"Fetching data for {ticker_symbol}..."):
             try:
-                company_data = get_company_market_data(ticker_symbol)
-                company_name = company_data["company_name"]
-                market_cap = company_data["market_cap"]
-                # Debt is reported in the statement currency; market cap is in the
-                # quote currency.
-                total_debt = company_data["total_debt"] * company_data["fx_rate"]
+                result = compute_wacc(
+                    ticker_symbol, risk_free_rate, emrp, marg_tax_rate, firm_rating, BETA_METHODS[beta_method]
+                )
+                (market_cap, total_debt, w_E, w_D, raw_beta, r_squared, regression_beta, bottom_up, beta,
+                 beta_note, cost_of_equity, credit_spread, cost_of_debt, wacc) = (
+                    result[key] for key in (
+                        "market_cap", "total_debt", "w_E", "w_D", "raw_beta", "r_squared", "regression_beta",
+                        "bottom_up", "beta", "beta_note", "cost_of_equity", "credit_spread", "cost_of_debt", "wacc",
+                    )
+                )
 
-                st.subheader(f"{company_name} ({ticker_symbol})")
-
-                # Calculate weights
-                w_E = market_cap / (market_cap + total_debt)
-                w_D = total_debt / (market_cap + total_debt)
-
-                # Calculate beta
-                raw_beta, r_squared, reg_results, return_data = calculate_beta(ticker_symbol)
-                regression_beta = adjust_beta_for_wacc(raw_beta)
-                bottom_up = get_bottom_up_beta(ticker_symbol, total_debt / market_cap, marg_tax_rate)
-                beta, beta_note = select_beta(BETA_METHODS[beta_method], regression_beta, bottom_up)
-
-                # Calculate cost of equity (CAPM)
-                cost_of_equity = risk_free_rate + beta * emrp
-
-                # Calculate cost of debt
-                credit_spread = get_credit_spread(firm_rating)
-                cost_of_debt = risk_free_rate + credit_spread
-
-                # Calculate WACC
-                wacc = (w_E * cost_of_equity) + (w_D * cost_of_debt * (1 - marg_tax_rate))
+                st.subheader(f"{result['company_name']} ({ticker_symbol})")
                 st.session_state["wacc_calculated_ticker"] = ticker_symbol
                 st.session_state["wacc_calculated_rate"] = wacc
 
@@ -2278,9 +2337,6 @@ def kpi_card(label, value, note=""):
     return f"<div class='stat-card'><div class='label'>{label}</div><div class='value'>{value}</div>{note_html}</div>"
 
 
-# Consensus growth above this is faded from year 1 rather than held.
-HOLD_GROWTH_CEILING = 0.20
-
 REINVESTMENT_METHODS = {
     "Growth-linked (sales-to-capital)": "linked",
     "Manual reinvestment rates": "manual",
@@ -2347,18 +2403,13 @@ def render_dcf():
             ):
                 val = projection_defaults[column]
                 if isinstance(val, (tuple, list)):
-                    st.session_state[key] = f"{val[0] * 100:.2f}, {val[1] * 100:.2f}"
+                    st.session_state[key] = ", ".join(f"{v * 100:.2f}" for v in val)
                 else:
                     st.session_state[key] = f"{val * 100:.2f}"
             st.session_state["dcf_growth_source"] = projection_defaults.get('_growth_source', 'placeholder')
             st.session_state["dcf_sales_to_capital"] = round(projection_defaults['Sales to Capital'], 2)
             st.session_state["dcf_da_ratio"] = projection_defaults['D&A % Revenue']
-            # Hold consensus growth for three years (roughly analysts'
-            # coverage) when it's moderate; hyper-growth fades at once, since
-            # the fastest growers mean-revert fastest.
-            st.session_state["dcf_hold_years"] = (
-                3 if forward_growth is not None and forward_growth <= HOLD_GROWTH_CEILING else 1
-            )
+            st.session_state["dcf_hold_years"] = default_hold_years(forward_growth)
 
             st.session_state["dcf_ronic_mode"] = next(iter(RONIC_MODES))
             historical_roc = projection_defaults.get('Historical ROC')
@@ -2417,8 +2468,10 @@ def render_dcf():
         )
     with col_g:
         growth_input = st.text_input(
-            "Revenue Growth (%) · year 1, final year", key="dcf_growth_input",
-            help="Year-1 growth is held for the high-growth years, then fades toward the final value."
+            "Revenue Growth (%) · year 1, year 2, final year", key="dcf_growth_input",
+            help="Year 1 = next-twelve-months consensus, year 2 = next-fiscal-year consensus, then a front-loaded "
+                 "fade to the final value. Two values (year 1, final) also work; High-Growth Years holds the "
+                 "last explicit year before fading."
         )
     with col_m:
         margin_input = st.text_input(
@@ -2505,8 +2558,8 @@ def render_dcf():
             return
     else:
         time_horizon = int(horizon_mode.split()[0])
-        if len(growth_values) > 2 or len(margin_values) > 2 or (reinv_values and len(reinv_values) > 2):
-            st.error("Enter one or two values per input, or switch to Custom comma-separated.")
+        if len(growth_values) > 3 or len(margin_values) > 2 or (reinv_values and len(reinv_values) > 2):
+            st.error("Enter up to three growth values and two margin / reinvestment values, or switch to Custom comma-separated.")
             return
     try:
         ebit_margins = expand_projection_input(margin_input, "EBIT margins", time_horizon)
@@ -2729,26 +2782,27 @@ def render_dcf():
 # Main App with Tabs
 # ============================================================================
 
-# Shared visual shell
-inject_styles()
-st.markdown("<div class='brand-mark'>PATEL DCF</div>", unsafe_allow_html=True)
+if __name__ == "__main__":
+    # Shared visual shell
+    inject_styles()
+    st.markdown("<div class='brand-mark'>PATEL DCF</div>", unsafe_allow_html=True)
 
-# Create tabs
-tab_home, tab_wacc, tab_historical, tab_dcf = st.tabs([
-    "🏠 Home",
-    "1️⃣ WACC Calculator",
-    "2️⃣ Historical Analysis",
-    "3️⃣ DCF Model"
-])
+    # Create tabs
+    tab_home, tab_wacc, tab_historical, tab_dcf = st.tabs([
+        "🏠 Home",
+        "1️⃣ WACC Calculator",
+        "2️⃣ Historical Analysis",
+        "3️⃣ DCF Model"
+    ])
 
-with tab_home:
-    render_home()
+    with tab_home:
+        render_home()
 
-with tab_wacc:
-    render_wacc()
+    with tab_wacc:
+        render_wacc()
 
-with tab_historical:
-    render_historical()
+    with tab_historical:
+        render_historical()
 
-with tab_dcf:
-    render_dcf()
+    with tab_dcf:
+        render_dcf()
