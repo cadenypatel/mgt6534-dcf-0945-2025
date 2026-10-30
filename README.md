@@ -31,7 +31,7 @@ Deploy your own instance via [Streamlit Cloud](https://share.streamlit.io)
 - Perpetual growth defaults to the lower of the risk-free rate and 3% (long-run nominal GDP) and must stay below WACC
 - Terminal value via Gordon Growth with reinvestment g / RONIC, mid-year discounting
 - Cross-checks: exit-multiple terminal value (EV/EBITDA) and a reverse DCF that solves for the market-implied year-1 growth
-- Bear / base / bull scenarios (growth and margin swings, weighted) and a WACC × perpetual-growth sensitivity grid
+- Separate bear / base / bull prices (growth and margin swings, not averaged) and a WACC × perpetual-growth sensitivity grid
 - Flags sectors where an FCFF DCF is a weak fit (banks, insurers, broker-dealers, REITs, regulated utilities, oil & gas, pre-profit biotech) and names the better method
 
 ## Installation

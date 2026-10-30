@@ -2471,7 +2471,7 @@ def render_dcf():
                 "Exit EV/EBITDA (0 = company's current multiple)", min_value=0.0, max_value=100.0, step=0.5,
                 value=0.0, key="dcf_exit_multiple",
             )
-        col_s1, col_s2, col_s3 = st.columns(3)
+        col_s1, col_s2 = st.columns(2)
         with col_s1:
             scenario_growth = st.number_input(
                 "Scenario Growth Swing (± pts)", min_value=0.0, max_value=30.0, value=3.0, step=0.5,
@@ -2481,11 +2481,6 @@ def render_dcf():
             scenario_margin = st.number_input(
                 "Scenario Margin Swing (± pts)", min_value=0.0, max_value=30.0, value=2.0, step=0.5,
                 key="dcf_scenario_margin",
-            ) / 100
-        with col_s3:
-            bear_weight = st.number_input(
-                "Bear / Bull Weight (%)", min_value=0.0, max_value=50.0, value=25.0, step=5.0,
-                key="dcf_scenario_weight", help="Base case gets the remainder.",
             ) / 100
 
     def terminal_ronic_for(discount_rate):
@@ -2556,7 +2551,6 @@ def render_dcf():
         terminal_ronic = terminal_ronic_for(wacc)
         terminal_reinv = get_terminal_reinvestment_rate(terminal_growth, terminal_ronic)
         valuation = run_dcf_case(case, wacc, terminal_growth, terminal_reinv)
-        weights = {"Bear": bear_weight, "Base": 1 - 2 * bear_weight, "Bull": bear_weight}
         scenarios = {
             name: run_dcf_case(case, wacc, terminal_growth, terminal_reinv, sign * scenario_growth, sign * scenario_margin)
             for name, sign in (("Bear", -1), ("Base", 0), ("Bull", 1))
@@ -2568,8 +2562,6 @@ def render_dcf():
 
     projections = valuation['projections']
     implied_price = valuation['share_price']
-    weighted_price = sum(weights[name] * scenarios[name]['share_price'] for name in scenarios)
-    upside = (implied_price - current_price) / current_price
 
     # === Results ===
     st.divider()
@@ -2590,14 +2582,22 @@ def render_dcf():
     if terminal_reinv > 1:
         st.warning("Terminal reinvestment exceeds 100% of NOPAT (negative terminal cash flow). Review growth and return on capital.")
 
+    def vs_market(price):
+        change = price / current_price - 1
+        color = "var(--teal)" if change >= 0 else "var(--coral)"
+        return f"<span style='color:{color}'>{change:+.1%}</span> vs market"
+
     k1, k2, k3, k4 = st.columns(4)
-    k1.markdown(kpi_card("Implied Price", f"${implied_price:,.2f}", "Base case"), unsafe_allow_html=True)
-    k2.markdown(kpi_card("Market Price", f"${current_price:,.2f}"), unsafe_allow_html=True)
-    color = "var(--teal)" if upside >= 0 else "var(--coral)"
-    k3.markdown(kpi_card("Upside / Downside", f"<span style='color:{color}'>{upside:+.1%}</span>"), unsafe_allow_html=True)
-    k4.markdown(kpi_card("Scenario-Weighted", f"${weighted_price:,.2f}",
-                         f"{weights['Bear']:.0%} bear / {weights['Base']:.0%} base / {weights['Bull']:.0%} bull"),
-                unsafe_allow_html=True)
+    k1.markdown(kpi_card("Market Price", f"${current_price:,.2f}"), unsafe_allow_html=True)
+    k2.markdown(kpi_card("Bear Case", f"${scenarios['Bear']['share_price']:,.2f}",
+                         vs_market(scenarios['Bear']['share_price'])), unsafe_allow_html=True)
+    k3.markdown(kpi_card("Base Case", f"${implied_price:,.2f}", vs_market(implied_price)), unsafe_allow_html=True)
+    k4.markdown(kpi_card("Bull Case", f"${scenarios['Bull']['share_price']:,.2f}",
+                         vs_market(scenarios['Bull']['share_price'])), unsafe_allow_html=True)
+    st.caption(
+        f"Bear / bull move year-1 growth ±{scenario_growth:.1%} and every year's EBIT margin ±{scenario_margin:.1%}; "
+        "adjust under Terminal return, exit multiple & scenarios."
+    )
     st.markdown("<div style='height: .75rem'></div>", unsafe_allow_html=True)
 
     tab_proj, tab_bridge, tab_checks, tab_sens = st.tabs(
@@ -2712,7 +2712,6 @@ def render_dcf():
             price = scenarios[name]['share_price']
             scenario_rows.append({
                 "Scenario": name,
-                "Weight": f"{weights[name]:.0%}",
                 "Year-1 Growth": f"{growth_values[0] + sign * scenario_growth:.1%}",
                 "Margin Shift": f"{sign * scenario_margin:+.1%}",
                 "Implied Price": f"${price:,.2f}",
