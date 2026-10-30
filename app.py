@@ -1583,7 +1583,15 @@ def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, for
 
     # Sales-to-capital links growth to the capital needed to fund it
     # (Damodaran): reinvestment = change in revenue / sales-to-capital.
-    sales_to_capital = _recency_weighted_average(stats['Sales to Capital'].dropna())
+    # Take the better of recent and full-window history: right after a capex
+    # cycle (new fabs, plants, data centers) capital is in place before the
+    # revenue it will carry, so the recent ratio understates how cheaply
+    # future growth can be funded.
+    sales_to_capital_history = stats['Sales to Capital'].dropna()
+    sales_to_capital = float(np.fmax(
+        _recency_weighted_average(sales_to_capital_history),
+        _average_dampening_giant_outliers_only(sales_to_capital_history),
+    ))
     defaults['Sales to Capital'] = (
         float(np.clip(sales_to_capital, 0.25, 15.0)) if np.isfinite(sales_to_capital) else 1.5
     )
