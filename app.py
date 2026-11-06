@@ -1740,31 +1740,26 @@ def historical_scenario_defaults(historical_data):
     return values, missing
 
 
-def build_scenario_assumptions(growth, margin, reinvestment, margin_change):
-    """Apply a symmetric relative margin shock; all inputs are percentages."""
-    values = (growth, margin, reinvestment, margin_change)
-    if not all(np.isfinite(value) for value in values) or margin_change < 0:
-        raise ValueError("Scenario assumptions must be finite and the margin change cannot be negative.")
-    margin_delta = abs(margin) * margin_change / 100
+def build_scenario_assumptions(growth, margin, reinvestment, growth_change, margin_change, reinvestment_change):
+    """Create illustrative cases around the base; inputs are percentage points."""
+    values = (growth, margin, reinvestment, growth_change, margin_change, reinvestment_change)
+    if not all(np.isfinite(value) for value in values) or any(value < 0 for value in values[3:]):
+        raise ValueError("Scenario assumptions must be finite and changes cannot be negative.")
     return pd.DataFrame({
         "Scenario": ["Bear", "Base", "Best"],
-        "Revenue growth (%)": [growth] * 3,
-        "EBIT margin (%)": [margin - margin_delta, margin, margin + margin_delta],
-        "Reinvestment rate (%)": [reinvestment] * 3,
+        "Revenue growth (%)": [growth - growth_change, growth, growth + growth_change],
+        "EBIT margin (%)": [margin - margin_change, margin, margin + margin_change],
+        "Reinvestment rate (%)": [reinvestment - reinvestment_change, reinvestment, reinvestment + reinvestment_change],
     })
 
 
 def scenario_range_warning(results):
-    """Flag inverted or substantially uneven scenario values without changing them."""
+    """Flag inverted scenario values without changing them."""
     bear, base, best = (results[name]["share_price"] for name in ("Bear", "Base", "Best"))
     if not all(np.isfinite(value) for value in (bear, base, best)):
         return "Scenario values are not finite. Review the assumptions."
     if bear > base or base > best:
         return "Scenario values are not ordered Bear ≤ Base ≤ Best. Review the operating assumptions."
-    downside, upside = base - bear, best - base
-    if max(downside, upside) > 0 and min(downside, upside) / max(downside, upside) < 0.8:
-        return ("The upside and downside ranges differ by more than 20%. "
-                "Review the scenario assumptions; DCF values need not be symmetric.")
     return None
 
 
@@ -1816,7 +1811,9 @@ def render_dcf():
                 "dcf_base_growth": defaults["Revenue Growth"],
                 "dcf_base_margin": defaults["EBIT Margin"],
                 "dcf_base_reinvestment": defaults["Reinv Rate"],
-                "dcf_margin_change": 10.0,
+                "dcf_growth_change": 2.0,
+                "dcf_margin_change_points": 1.0,
+                "dcf_reinvestment_change": 2.0,
                 "dcf_custom_scenarios": False,
                 "dcf_revenue": float(revenue / 1e6),
                 "dcf_revenue_date": pd.Timestamp(revenue_date).date(),
@@ -1872,23 +1869,33 @@ def render_dcf():
 
     st.markdown("### Scenario assumptions")
     st.caption("Base assumptions start at the annual historical averages and remain constant through the forecast. "
-               "An overlapping LTM period is excluded. Bear and best apply equal relative changes to the base EBIT margin; "
-               "growth, reinvestment, WACC and perpetual growth stay the same.")
-    a1, a2, a3, a4 = st.columns(4)
+               "An overlapping LTM period is excluded. The initial cases illustrate slower growth and lower margins "
+               "with less reinvestment in the bear case, and the reverse in the best case.")
+    a1, a2, a3 = st.columns(3)
     growth = a1.number_input("Base Revenue Growth (%)", step=0.5, key="dcf_base_growth")
     margin = a2.number_input("Base EBIT Margin (%)", step=0.5, key="dcf_base_margin")
     reinvestment = a3.number_input("Base Reinvestment Rate (%)", step=0.5, key="dcf_base_reinvestment")
-    margin_change = a4.number_input(
-        "EBIT Margin Change (±% of base)", min_value=0.0, step=1.0, key="dcf_margin_change",
-        help="For a 20% base margin and a 10% change, bear is 18% and best is 22%.",
-    )
-    scenarios = build_scenario_assumptions(growth, margin, reinvestment, margin_change)
-    if margin == 0:
-        st.warning("The base EBIT margin is zero, so a relative margin change produces identical cases. "
-                   "Enter a margin or use custom scenarios.")
+    st.caption("Illustrative symmetric starting changes, in percentage points; adjust them or edit each case directly. "
+               "They are not analyst forecasts and may not fit this company.")
+    for key, default in (("dcf_growth_change", 2.0), ("dcf_margin_change_points", 1.0),
+                         ("dcf_reinvestment_change", 2.0)):
+        if key not in st.session_state:
+            st.session_state[key] = default
+    s1, s2, s3 = st.columns(3)
+    growth_change = s1.number_input("Growth Change (± pp)", min_value=0.0, step=0.5, key="dcf_growth_change")
+    margin_change = s2.number_input("Margin Change (± pp)", min_value=0.0, step=0.5, key="dcf_margin_change_points")
+    reinvestment_change = s3.number_input("Reinvestment Rate Change (± pp)", min_value=0.0, step=0.5,
+                                         key="dcf_reinvestment_change")
+    try:
+        scenarios = build_scenario_assumptions(
+            growth, margin, reinvestment, growth_change, margin_change, reinvestment_change
+        )
+    except ValueError as error:
+        st.error(f"Cannot build scenarios: {error}")
+        return
     custom = st.checkbox("Edit individual scenario assumptions", key="dcf_custom_scenarios")
     if custom:
-        st.caption("Custom inputs can produce unequal ranges; use assumptions consistent with each case.")
+        st.caption("Use company-specific assumptions consistent with each case, including the investment needed for growth.")
         scenarios = st.data_editor(
             scenarios,
             key=f"dcf_scenarios_{st.session_state['dcf_scenario_revision']}",
@@ -1933,8 +1940,8 @@ def render_dcf():
         implied = results[name]["share_price"]
         delta = f"{(implied / price - 1):+.1%} vs. market" if price > 0 else None
         column.metric(name, f"{implied:,.2f} {company['price_currency']}", delta)
-    st.caption("Default cases are an operating-margin sensitivity, not probability-weighted forecasts. "
-               "A symmetrical input change does not guarantee symmetrical values when other scenario inputs differ.")
+    st.caption("WACC, perpetual growth, tax and the equity bridge are shared across cases. "
+               "Scenarios are not probability-weighted forecasts; their values need not be equally spaced.")
     if price <= 0:
         st.caption("Enter a positive current share price to see upside or downside.")
     if any(result["terminal_fcf"] < 0 for result in results.values()):

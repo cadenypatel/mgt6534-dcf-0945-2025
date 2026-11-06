@@ -42,10 +42,11 @@ class DcfCalculationTests(unittest.TestCase):
         self.assertAlmostEqual(defaults["EBIT Margin"], 30.0)
         self.assertAlmostEqual(defaults["Reinv Rate"], 30.0)
 
-    def test_symmetric_case_shocks_and_valuation(self):
-        cases = app.build_scenario_assumptions(20, 40, 30, 10)
-        np.testing.assert_allclose(cases["EBIT margin (%)"], [36, 40, 44])
-        np.testing.assert_allclose(cases["Revenue growth (%)"], [20, 20, 20])
+    def test_multiple_scenario_drivers_and_valuation(self):
+        cases = app.build_scenario_assumptions(20, 40, 30, 2, 1, 2)
+        np.testing.assert_allclose(cases["EBIT margin (%)"], [39, 40, 41])
+        np.testing.assert_allclose(cases["Revenue growth (%)"], [18, 20, 22])
+        np.testing.assert_allclose(cases["Reinvestment rate (%)"], [28, 30, 32])
         values = {}
         for _, case in cases.iterrows():
             projection = app.build_dcf_projections(
@@ -58,13 +59,13 @@ class DcfCalculationTests(unittest.TestCase):
         bear, base, best = (values[name]["share_price"] for name in ("Bear", "Base", "Best"))
         self.assertLess(bear, base)
         self.assertLess(base, best)
-        self.assertAlmostEqual(base - bear, best - base)
+        self.assertNotAlmostEqual(base - bear, best - base)
         self.assertIsNone(app.scenario_range_warning(values))
 
     def test_case_warnings_and_negative_margin(self):
-        cases = app.build_scenario_assumptions(0, -20, 25, 10)
-        np.testing.assert_allclose(cases["EBIT margin (%)"], [-22, -20, -18])
-        for prices, expected in [([120, 100, 130], "not ordered"), ([90, 100, 140], "differ"),
+        cases = app.build_scenario_assumptions(0, -20, 25, 2, 1, 2)
+        np.testing.assert_allclose(cases["EBIT margin (%)"], [-21, -20, -19])
+        for prices, expected in [([120, 100, 130], "not ordered"), ([90, 100, 140], None),
                                  ([90, 100, 110], None)]:
             results = {name: {"share_price": price} for name, price in zip(("Bear", "Base", "Best"), prices)}
             warning = app.scenario_range_warning(results)
@@ -73,9 +74,9 @@ class DcfCalculationTests(unittest.TestCase):
             else:
                 self.assertIn(expected, warning)
         with self.assertRaises(ValueError):
-            app.build_scenario_assumptions(0, 0, 0, -1)
+            app.build_scenario_assumptions(0, 0, 0, -1, 1, 2)
 
-    def test_outlying_history_does_not_make_case_offsets_asymmetric(self):
+    def test_outlying_history_does_not_set_scenario_extremes(self):
         stats = pd.DataFrame({
             "Revenue Growth": [0.05, 0.06, 0.50],
             "EBIT Margin": [0.10, 0.12, 0.80],
@@ -83,16 +84,11 @@ class DcfCalculationTests(unittest.TestCase):
         })
         defaults, _ = app.historical_scenario_defaults({"df_stats": stats})
         cases = app.build_scenario_assumptions(
-            defaults["Revenue Growth"], defaults["EBIT Margin"], defaults["Reinv Rate"], 10
+            defaults["Revenue Growth"], defaults["EBIT Margin"], defaults["Reinv Rate"], 2, 1, 2
         )
-        values = []
-        for _, case in cases.iterrows():
-            projection = app.build_dcf_projections(
-                1000, pd.Timestamp("2025-12-31"), [case["Revenue growth (%)"] / 100] * 5,
-                [case["EBIT margin (%)"] / 100] * 5, [case["Reinvestment rate (%)"] / 100] * 5, 0.21
-            )
-            values.append(app.calculate_dcf_valuation(projection, 0.09, 0.03, 0, 0, 10)["share_price"])
-        self.assertAlmostEqual(values[1] - values[0], values[2] - values[1])
+        np.testing.assert_allclose(cases["Revenue growth (%)"],
+                                   [defaults["Revenue Growth"] - 2, defaults["Revenue Growth"],
+                                    defaults["Revenue Growth"] + 2])
 
     def test_quarterly_ltm_is_not_restricted_to_2026_or_partial_sums(self):
         dates = pd.to_datetime(["2026-06-30", "2026-09-30", "2026-12-31", "2027-03-31"])
@@ -225,27 +221,29 @@ class DcfWorkflowTests(unittest.TestCase):
             "added_rows": [], "deleted_rows": [],
         }
         ui.run()
-        self.assertTrue(any("ranges differ" in warning.value for warning in ui.warning))
+        best_after_custom = next(metric.value for metric in ui.metric if metric.label == "Best")
+        self.assertNotEqual(base_after_scenario, best_after_custom)
         ui.number_input(key="dcf_cash").set_value(70.0).run()
         self.assertFalse(ui.exception)
         self.assertEqual(ui.number_input(key="dcf_cash").value, 70.0)
         self.assertNotEqual(base_after_scenario, next(metric.value for metric in ui.metric if metric.label == "Base"))
 
-    def test_symmetric_defaults_update_with_base_and_shock(self):
+    def test_scenario_inputs_update_values(self):
         ui = AppTest.from_string(UI_SCRIPT, default_timeout=20).run()
         def prices():
             return [float(next(metric.value for metric in ui.metric if metric.label == label).split()[0].replace(",", ""))
                     for label in ("Bear", "Base", "Best")]
         bear, base, best = prices()
-        self.assertAlmostEqual(base - bear, best - base, delta=0.02)
+        self.assertLess(bear, base)
+        self.assertLess(base, best)
         ui.number_input(key="dcf_base_margin").set_value(40.0)
-        ui.number_input(key="dcf_margin_change").set_value(20.0).run()
+        ui.number_input(key="dcf_growth_change").set_value(4.0)
+        ui.number_input(key="dcf_margin_change_points").set_value(2.0)
+        ui.number_input(key="dcf_reinvestment_change").set_value(3.0).run()
         bear, base, best = prices()
         self.assertLess(bear, base)
         self.assertLess(base, best)
-        self.assertAlmostEqual(base - bear, best - base, delta=0.02)
-        ui.number_input(key="dcf_base_margin").set_value(0.0).run()
-        self.assertTrue(any("identical cases" in warning.value for warning in ui.warning))
+        self.assertNotAlmostEqual(base - bear, best - base, delta=0.02)
 
     def test_invalid_terminal_and_ticker_refresh(self):
         ui = AppTest.from_string(UI_SCRIPT, default_timeout=20).run()
