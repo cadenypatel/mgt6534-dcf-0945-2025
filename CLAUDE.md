@@ -60,7 +60,8 @@ The app (`app.py`) uses a tabbed interface with four sections:
 ### Tab 3: DCF Model
 - Inputs: Ticker, WACC, terminal growth rate, effective tax rate, LTM revenue, and editable equity-bridge figures
 - Bear, base, and best cases use editable revenue growth, EBIT margins, and reinvestment rates held constant over the forecast
-- Defaults use unweighted annual historical minimum/mean/maximum growth and margins and mean reinvestment; overlapping LTM observations are excluded
+- Base defaults use unweighted annual historical means; overlapping LTM observations are excluded
+- Default bear and best cases apply an editable symmetric relative shock to base EBIT margin, while custom scenario assumptions remain editable
 - Fetches LTM revenue from quarterly data as starting point
 - Projects Revenue → EBIT → NOPAT → FCF for each year
 - Calculates terminal value via Gordon Growth Model

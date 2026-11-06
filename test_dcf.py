@@ -16,11 +16,11 @@ class DcfCalculationTests(unittest.TestCase):
             "EBIT Margin": [0.2, 0.4, 0.3],
             "Reinv Rate": [0.2, 0.5, 0.8],
         })
-        cases, missing = app.historical_scenario_defaults({"df_stats": stats})
+        defaults, missing = app.historical_scenario_defaults({"df_stats": stats})
         self.assertEqual(missing, [])
-        np.testing.assert_allclose(cases["Revenue growth (%)"], [10, 20, 30])
-        np.testing.assert_allclose(cases["EBIT margin (%)"], [20, 30, 40])
-        np.testing.assert_allclose(cases["Reinvestment rate (%)"], [50, 50, 50])
+        self.assertAlmostEqual(defaults["Revenue Growth"], 20)
+        self.assertAlmostEqual(defaults["EBIT Margin"], 30)
+        self.assertAlmostEqual(defaults["Reinv Rate"], 50)
 
     def test_missing_history_is_reported(self):
         stats = pd.DataFrame({
@@ -28,9 +28,9 @@ class DcfCalculationTests(unittest.TestCase):
             "EBIT Margin": [0.3],
             "Reinv Rate": [np.inf],
         })
-        cases, missing = app.historical_scenario_defaults({"df_stats": stats})
+        defaults, missing = app.historical_scenario_defaults({"df_stats": stats})
         self.assertEqual(missing, ["Revenue Growth", "Reinv Rate"])
-        self.assertTrue((cases["Revenue growth (%)"] == 0).all())
+        self.assertEqual(defaults["Revenue Growth"], 0)
 
     def test_overlapping_ltm_is_excluded_from_assumption_averages(self):
         stats = pd.DataFrame({
@@ -38,9 +38,61 @@ class DcfCalculationTests(unittest.TestCase):
             "EBIT Margin": [0.2, 0.4, 0.9],
             "Reinv Rate": [0.2, 0.4, 0.9],
         }, index=pd.to_datetime(["2024-12-31", "2025-12-31", "2026-06-30"]))
-        cases, _ = app.historical_scenario_defaults({"df_stats": stats})
-        self.assertAlmostEqual(cases.loc[1, "EBIT margin (%)"], 30.0)
-        self.assertAlmostEqual(cases.loc[1, "Reinvestment rate (%)"], 30.0)
+        defaults, _ = app.historical_scenario_defaults({"df_stats": stats})
+        self.assertAlmostEqual(defaults["EBIT Margin"], 30.0)
+        self.assertAlmostEqual(defaults["Reinv Rate"], 30.0)
+
+    def test_symmetric_case_shocks_and_valuation(self):
+        cases = app.build_scenario_assumptions(20, 40, 30, 10)
+        np.testing.assert_allclose(cases["EBIT margin (%)"], [36, 40, 44])
+        np.testing.assert_allclose(cases["Revenue growth (%)"], [20, 20, 20])
+        values = {}
+        for _, case in cases.iterrows():
+            projection = app.build_dcf_projections(
+                1000, pd.Timestamp("2025-12-31"), [case["Revenue growth (%)"] / 100] * 5,
+                [case["EBIT margin (%)"] / 100] * 5, [case["Reinvestment rate (%)"] / 100] * 5, 0.21
+            )
+            values[case["Scenario"]] = app.calculate_dcf_valuation(
+                projection, 0.09, 0.03, 200, 50, 10, non_operating_assets=20, fx_rate=1.2
+            )
+        bear, base, best = (values[name]["share_price"] for name in ("Bear", "Base", "Best"))
+        self.assertLess(bear, base)
+        self.assertLess(base, best)
+        self.assertAlmostEqual(base - bear, best - base)
+        self.assertIsNone(app.scenario_range_warning(values))
+
+    def test_case_warnings_and_negative_margin(self):
+        cases = app.build_scenario_assumptions(0, -20, 25, 10)
+        np.testing.assert_allclose(cases["EBIT margin (%)"], [-22, -20, -18])
+        for prices, expected in [([120, 100, 130], "not ordered"), ([90, 100, 140], "differ"),
+                                 ([90, 100, 110], None)]:
+            results = {name: {"share_price": price} for name, price in zip(("Bear", "Base", "Best"), prices)}
+            warning = app.scenario_range_warning(results)
+            if expected is None:
+                self.assertIsNone(warning)
+            else:
+                self.assertIn(expected, warning)
+        with self.assertRaises(ValueError):
+            app.build_scenario_assumptions(0, 0, 0, -1)
+
+    def test_outlying_history_does_not_make_case_offsets_asymmetric(self):
+        stats = pd.DataFrame({
+            "Revenue Growth": [0.05, 0.06, 0.50],
+            "EBIT Margin": [0.10, 0.12, 0.80],
+            "Reinv Rate": [0.20, 0.25, 0.30],
+        })
+        defaults, _ = app.historical_scenario_defaults({"df_stats": stats})
+        cases = app.build_scenario_assumptions(
+            defaults["Revenue Growth"], defaults["EBIT Margin"], defaults["Reinv Rate"], 10
+        )
+        values = []
+        for _, case in cases.iterrows():
+            projection = app.build_dcf_projections(
+                1000, pd.Timestamp("2025-12-31"), [case["Revenue growth (%)"] / 100] * 5,
+                [case["EBIT margin (%)"] / 100] * 5, [case["Reinvestment rate (%)"] / 100] * 5, 0.21
+            )
+            values.append(app.calculate_dcf_valuation(projection, 0.09, 0.03, 0, 0, 10)["share_price"])
+        self.assertAlmostEqual(values[1] - values[0], values[2] - values[1])
 
     def test_quarterly_ltm_is_not_restricted_to_2026_or_partial_sums(self):
         dates = pd.to_datetime(["2026-06-30", "2026-09-30", "2026-12-31", "2027-03-31"])
@@ -162,19 +214,38 @@ class DcfWorkflowTests(unittest.TestCase):
         base_after_wacc = next(metric.value for metric in ui.metric if metric.label == "Base")
         self.assertNotEqual(base_before, base_after_wacc)
 
-        scenario_key = f"dcf_scenarios_{ui.session_state['dcf_scenario_revision']}"
-        ui.session_state[scenario_key] = {
-            "edited_rows": {1: {"Revenue growth (%)": 30.0}},
-            "added_rows": [], "deleted_rows": [],
-        }
-        ui.run()
+        ui.number_input(key="dcf_base_growth").set_value(30.0).run()
         self.assertFalse(ui.exception)
         base_after_scenario = next(metric.value for metric in ui.metric if metric.label == "Base")
         self.assertNotEqual(base_after_wacc, base_after_scenario)
+        ui.checkbox(key="dcf_custom_scenarios").check().run()
+        scenario_key = f"dcf_scenarios_{ui.session_state['dcf_scenario_revision']}"
+        ui.session_state[scenario_key] = {
+            "edited_rows": {2: {"Revenue growth (%)": 80.0}},
+            "added_rows": [], "deleted_rows": [],
+        }
+        ui.run()
+        self.assertTrue(any("ranges differ" in warning.value for warning in ui.warning))
         ui.number_input(key="dcf_cash").set_value(70.0).run()
         self.assertFalse(ui.exception)
         self.assertEqual(ui.number_input(key="dcf_cash").value, 70.0)
         self.assertNotEqual(base_after_scenario, next(metric.value for metric in ui.metric if metric.label == "Base"))
+
+    def test_symmetric_defaults_update_with_base_and_shock(self):
+        ui = AppTest.from_string(UI_SCRIPT, default_timeout=20).run()
+        def prices():
+            return [float(next(metric.value for metric in ui.metric if metric.label == label).split()[0].replace(",", ""))
+                    for label in ("Bear", "Base", "Best")]
+        bear, base, best = prices()
+        self.assertAlmostEqual(base - bear, best - base, delta=0.02)
+        ui.number_input(key="dcf_base_margin").set_value(40.0)
+        ui.number_input(key="dcf_margin_change").set_value(20.0).run()
+        bear, base, best = prices()
+        self.assertLess(bear, base)
+        self.assertLess(base, best)
+        self.assertAlmostEqual(base - bear, best - base, delta=0.02)
+        ui.number_input(key="dcf_base_margin").set_value(0.0).run()
+        self.assertTrue(any("identical cases" in warning.value for warning in ui.warning))
 
     def test_invalid_terminal_and_ticker_refresh(self):
         ui = AppTest.from_string(UI_SCRIPT, default_timeout=20).run()

@@ -28,7 +28,8 @@ Deploy your own instance via [Streamlit Cloud](https://share.streamlit.io)
 ### DCF Model
 - Uses LTM (Last Twelve Months) revenue as starting point
 - Bear, base, and best cases with editable revenue growth, EBIT margin, and reinvestment rates, held constant throughout each forecast
-- Defaults use the minimum, arithmetic mean, and maximum annual historical growth and margin, and the mean historical reinvestment rate for all cases; overlapping LTM observations are excluded
+- Base assumptions use arithmetic means of available annual historical data; overlapping LTM observations are excluded
+- Default bear and best cases use equal relative changes to the base EBIT margin (10% initially), holding growth, reinvestment, WACC, and terminal growth constant. Each case can also be edited independently
 - Editable forecast horizon, LTM revenue and date, tax rate, WACC, perpetual growth, debt, cash, non-operating investments, minority interest, diluted shares, exchange rate, and market price
 - Gordon Growth terminal value and mid-year discounted cash flows; displays a forecast and equity-value bridge for each selected case
 - Perpetual growth must be below WACC; review the continuing reinvestment assumption for consistency with perpetual growth
@@ -65,7 +66,9 @@ streamlit run app.py
 
 The model values free cash flow to the firm. Perpetual growth is separate from the forecast-period assumptions and must be lower than WACC. Terminal FCF grows the final forecast year's FCF, so its reinvestment rate is implicitly continued in perpetuity. Users should ensure that rate is sufficient to support their chosen perpetual growth, particularly for capital-intensive businesses.
 
-The historical minimum and maximum may come from different years; they are starting points, not probability-weighted forecasts. Review each scenario, particularly reinvestment, for internal consistency. When data is unavailable, the app identifies placeholders for the user to replace. Financial data and share counts can be incomplete or overlap (for example cash and investments), so verify the equity bridge and FX conversion. Results are estimates, not guaranteed fair values or investment advice.
+The default cases are a symmetric operating-margin sensitivity, not a forecast or probability-weighted target. For example, a 20% base margin and a 10% relative change give 18% and 22% margins. This produces equal absolute price changes around the base under the model's shared assumptions; it is not a guarantee of symmetric percentage returns. Users can edit the underlying cases independently to represent coherent business scenarios. DCF outputs may be asymmetric when multiple inputs vary; the app flags inverted or materially uneven value ranges rather than forcing share prices to be symmetric. Review each scenario, particularly reinvestment, for internal consistency. For practitioner discussion of scenario assumptions and consistent model cases, see [CFI's scenario analysis guide](https://corporatefinanceinstitute.com/resources/financial-modeling/scenario-analysis/) and [Oxxon Advisors' DCF scenario analysis guide](https://www.oxxonadvisors.com/fmae-knowledge-centre/technical-guides/dcf-scenario-analysis/). These sources do not prescribe a universal 10% shock; it is an editable starting point.
+
+When data is unavailable, the app identifies placeholders for the user to replace. Financial data and share counts can be incomplete or overlap (for example cash and investments), so verify the equity bridge and FX conversion. Results are estimates, not guaranteed fair values or investment advice.
 
 ## Data Sources
 
