@@ -1011,6 +1011,9 @@ def get_sec_historical_statements(ticker_symbol):
         facts,
         ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
     )
+    goodwill = _sec_fact_series(facts, ["Goodwill"])
+    amortization = _sec_fact_series(facts, ["AmortizationOfIntangibleAssets"])
+    stock_compensation = _sec_fact_series(facts, ["ShareBasedCompensation", "AllocatedShareBasedCompensationExpense"])
     capital_expenditure = _sec_fact_series(
         facts,
         [
@@ -1046,6 +1049,8 @@ def get_sec_historical_statements(ticker_symbol):
     income_statement["Cost Of Revenue"] = cost_of_revenue.reindex(income_index)
     income_statement["Tax Provision"] = tax_provision.reindex(income_index)
     income_statement["Pretax Income"] = pretax_income.reindex(income_index)
+    income_statement["Amortization Of Intangibles"] = amortization.reindex(income_index)
+    income_statement["Stock Based Compensation"] = stock_compensation.reindex(income_index)
 
     balance_sheet = pd.DataFrame(index=balance_index)
     # Forward/back-fill sporadic single-year gaps (e.g., a company switching
@@ -1065,6 +1070,7 @@ def get_sec_historical_statements(ticker_symbol):
         balance_sheet["Current Debt"] + balance_sheet["Long Term Debt And Capital Lease Obligation"]
     )
     balance_sheet["Stockholders Equity"] = equity.reindex(balance_index).ffill().bfill()
+    balance_sheet["Goodwill"] = goodwill.reindex(balance_index).ffill().fillna(0)
 
     cash_flows = pd.DataFrame(index=cash_flow_index)
     cash_flows["Capital Expenditure"] = -capital_expenditure.abs().reindex(cash_flow_index)
@@ -1140,7 +1146,14 @@ def _augment_with_latest_quarterly(ticker_symbol, income_statement, balance_shee
             income_statement.loc[latest_q, 'Total Revenue'] = _statement_series(tail_qi, ['Total Revenue', 'Operating Revenue']).sum()
             # Yahoo's quarterly "EBIT" includes non-operating income (investment
             # gains, equity-method income); operating income is the FCFF driver.
-            ltm_operating_income = _statement_series(tail_qi, ['Operating Income', 'EBIT']).sum()
+            # A quarter whose operating income is more than 15% of revenue away
+            # from pretax income + interest is a data error; use the rebuild.
+            quarter_operating = _statement_series(tail_qi, ['Operating Income', 'EBIT'])
+            quarter_rebuilt = (_statement_series(tail_qi, ['Pretax Income'])
+                               + _statement_series(tail_qi, ['Interest Expense', 'Interest Expense Non Operating']).abs().fillna(0))
+            quarter_revenue = _statement_series(tail_qi, ['Total Revenue', 'Operating Revenue']).abs()
+            inconsistent = (quarter_operating - quarter_rebuilt).abs() > 0.15 * quarter_revenue
+            ltm_operating_income = quarter_operating.where(~inconsistent, quarter_rebuilt).sum()
             income_statement.loc[latest_q, 'EBIT'] = ltm_operating_income
             if 'Operating Income' in income_statement.columns:
                 income_statement.loc[latest_q, 'Operating Income'] = ltm_operating_income
@@ -1168,6 +1181,8 @@ def _augment_with_latest_quarterly(ticker_symbol, income_statement, balance_shee
                         balance_sheet.loc[latest_q, col] = _statement_series(df_q, ['Long Term Debt And Capital Lease Obligation', 'Long Term Debt'], default=0).iloc[0]
                     elif col == 'Total Debt':
                         balance_sheet.loc[latest_q, col] = _statement_series(df_q, ['Total Debt'], default=0).iloc[0]
+                    elif col == 'Goodwill':
+                        balance_sheet.loc[latest_q, col] = _statement_series(df_q, ['Goodwill'], default=0).iloc[0]
                     elif col in ('Stockholders Equity', 'Common Stock Equity', 'Total Equity Gross Minority Interest'):
                         balance_sheet.loc[latest_q, col] = _statement_series(df_q, ['Stockholders Equity', 'Common Stock Equity', 'Total Equity Gross Minority Interest'], default=0).iloc[0]
 
@@ -1417,8 +1432,13 @@ def get_historical_data(ticker_symbol):
         default=0,
     )
     invested_capital = total_debt + equity - invested_cash
+    # Organic growth doesn't repeat past acquisition premiums, so returns on
+    # new capital are measured on invested capital excluding goodwill.
+    operating_capital = invested_capital - _statement_series(balance_sheet, ['Goodwill'], default=0).fillna(0)
     invested_capital = invested_capital.where(invested_capital > 0)
+    operating_capital = operating_capital.where(operating_capital > 0)
     average_invested_capital = invested_capital.rolling(2, min_periods=2).mean()
+    average_operating_capital = operating_capital.rolling(2, min_periods=2).mean()
 
     balance_sheet = balance_sheet.reindex(historical_periods)
 
@@ -1453,6 +1473,9 @@ def get_historical_data(ticker_symbol):
 
     df_stats['Return on Capital'] = (
         income_statement['NOPAT'] / average_invested_capital.reindex(income_statement.index)
+    ).replace([np.inf, -np.inf], np.nan)
+    df_stats['ROC ex Goodwill'] = (
+        income_statement['NOPAT'] / average_operating_capital.reindex(income_statement.index)
     ).replace([np.inf, -np.inf], np.nan)
     # Revenue generated per dollar of invested capital; links projected
     # growth to the reinvestment needed to fund it.
@@ -1523,6 +1546,52 @@ def calculate_terminal_growth_rate(historical_data, risk_free_rate):
     )
 
 
+def _non_gaap_adjustment(ticker, income_statement, ltm_revenue, tax_rate, diluted_shares):
+    """EBIT margin points to deduct from adjusted (non-GAAP) consensus to put
+    it on a GAAP basis: the latest annual amortization of acquired intangibles
+    plus stock compensation, capped at the LTM gap between reported adjusted
+    EPS and GAAP net income (so items the company doesn't adjust out aren't
+    charged twice). None when neither measure is available."""
+    recurring = np.nan
+    names = {'Amortization Of Intangibles': ['Amortization Of Intangibles', 'Amortization Cash Flow'],
+             'Stock Based Compensation': ['Stock Based Compensation']}
+    yahoo_cash_flow = yahoo_income = None
+    for column, yahoo_names in names.items():
+        share = np.nan
+        if income_statement is not None and column in income_statement:
+            ratio = (income_statement[column] / income_statement['Total Revenue']).replace([np.inf, -np.inf], np.nan).dropna()
+            share = float(ratio.iloc[-1]) if not ratio.empty else np.nan
+        if not np.isfinite(share):
+            try:
+                if yahoo_cash_flow is None:
+                    yahoo_cash_flow = ticker.cashflow.T.sort_index()
+                    yahoo_income = ticker.financials.T.sort_index()
+                ratio = (_statement_series(yahoo_cash_flow, yahoo_names).abs()
+                         / _statement_series(yahoo_income, ['Total Revenue'])).dropna()
+                share = float(ratio.iloc[-1]) if not ratio.empty else np.nan
+            except Exception:
+                pass
+        if np.isfinite(share):
+            recurring = (0.0 if np.isnan(recurring) else recurring) + share
+
+    measured = np.nan
+    try:
+        adjusted_eps = pd.to_numeric(ticker.earnings_history['epsActual'], errors='coerce').dropna().tail(4)
+        quarterly = ticker.quarterly_income_stmt.T.sort_index()
+        gaap_income = _statement_series(quarterly, ['Net Income', 'Net Income Common Stockholders']).dropna().tail(4)
+        if len(adjusted_eps) == 4 and len(gaap_income) == 4:
+            gap = adjusted_eps.sum() * diluted_shares - gaap_income.sum()
+            measured = max(float(gap), 0.0) / (1 - tax_rate) / ltm_revenue
+    except Exception:
+        pass
+
+    if np.isfinite(recurring) and np.isfinite(measured):
+        return min(recurring, measured)
+    if np.isfinite(recurring):
+        return recurring
+    return measured if np.isfinite(measured) else None
+
+
 def get_consensus_forecast(ticker_symbol, ltm_revenue, ltm_date, historical_data=None, tax_rate=None,
                            diluted_shares=None):
     """Analyst consensus for forecast years 1 and 2, aligned to the LTM date.
@@ -1530,11 +1599,13 @@ def get_consensus_forecast(ticker_symbol, ltm_revenue, ltm_date, historical_data
     Consensus is published per fiscal year (current "0y" and next "+1y"). Year 1
     is the twelve months after the LTM date, a blend of the two fiscal years by
     how much of the current one is still ahead; year 2 grows year 1 at the
-    consensus fiscal-year growth. EBIT margins are backed out of GAAP EPS
-    (net income ÷ (1 − tax) × the LTM EBIT-to-pretax ratio); non-GAAP EPS
-    excludes real costs, so it is not converted. Returns a dict with 'growth'
-    (y1, y2) and 'margin' (y1, y2) or None for either, or None if there is no
-    revenue consensus.
+    consensus fiscal-year growth. EBIT margins are backed out of consensus EPS
+    (net income ÷ (1 − tax) × the LTM EBIT-to-pretax ratio). Adjusted
+    (non-GAAP) EPS is first put on a GAAP basis: amortization of acquired
+    intangibles and stock compensation are charged back, but never more than
+    the gap the company actually reported between adjusted and GAAP earnings
+    over the LTM. Returns a dict with 'growth' (y1, y2) and 'margin' (y1, y2)
+    or None for either, or None if there is no revenue consensus.
     """
     try:
         ticker = yf.Ticker(ticker_symbol)
@@ -1565,16 +1636,18 @@ def get_consensus_forecast(ticker_symbol, ltm_revenue, ltm_date, historical_data
             ebit_ltm = float(income['EBIT'].dropna().iloc[-1])
             pretax_ltm = float(pd.to_numeric(income['Pretax Income'], errors="coerce").dropna().iloc[-1])
             ebit_to_pretax = ebit_ltm / pretax_ltm
-            if (gaap and eps_fy0 > 0 and eps_fy1 > 0 and diluted_shares and tax_rate is not None
-                    and 0.5 < ebit_to_pretax < 2.0):
+            adjustment = 0.0 if gaap else _non_gaap_adjustment(ticker, income, ltm_revenue, tax_rate, diluted_shares)
+            if (adjustment is not None and eps_fy0 > 0 and eps_fy1 > 0 and diluted_shares
+                    and tax_rate is not None and 0.5 < ebit_to_pretax < 2.0):
                 eps_y1 = remaining * eps_fy0 + (1 - remaining) * eps_fy1
                 eps_y2 = eps_y1 * eps_fy1 / eps_fy0
                 margins = tuple(
-                    eps_value * diluted_shares / (1 - tax_rate) * ebit_to_pretax / revenue_value
+                    eps_value * diluted_shares / (1 - tax_rate) * ebit_to_pretax / revenue_value - adjustment
                     for eps_value, revenue_value in ((eps_y1, revenue_y1), (eps_y2, revenue_y2))
                 )
                 if all(-0.5 < margin < 0.8 for margin in margins):
                     forecast['margin'] = margins
+                    forecast['margin_basis'] = 'GAAP' if gaap else f'adjusted, less {adjustment:.1%} of revenue'
         except Exception:
             pass
 
@@ -1611,12 +1684,13 @@ def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, con
       perpetual growth in the final year. Without consensus, the historical
       average growth. Perpetual growth is the risk-free rate, capped at the
       company's last explicit growth rate and floored at zero.
-    - EBIT margin: consensus for years 1-2 (from GAAP EPS), else the LTM
-      margin; then a straight line to the historical average margin.
+    - EBIT margin: consensus for years 1-2 (from EPS, on a GAAP basis), else
+      the LTM margin; then a straight line to the historical average margin.
     - D&A and capex: the LTM share of revenue in year 1. Capex then moves to
       the steady-state level the terminal value assumes (set at run time).
     - Working capital: the historical average share of revenue.
-    - Return on capital: the historical average, used for terminal reinvestment.
+    - Return on new capital: the historical average excluding goodwill, used
+      for terminal reinvestment and steady-state capex.
     """
     stats = historical_data['df_stats'].replace([np.inf, -np.inf], np.nan)
     defaults = {'_fallback_columns': []}
@@ -1644,7 +1718,8 @@ def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, con
     average_margin = first_finite(_historical_mean(stats, 'EBIT Margin'), fallback=0.15, label='EBIT Margin')
     if consensus and consensus.get('margin'):
         defaults['EBIT Margin'] = (*consensus['margin'], average_margin)
-        defaults['_margin_source'] = 'consensus GAAP EPS for years 1-2, then the historical average'
+        defaults['_margin_source'] = (f"consensus EPS ({consensus.get('margin_basis', 'GAAP')}) for years 1-2, "
+                                      "then the historical average")
     else:
         latest_margin = first_finite(_latest(stats, 'EBIT Margin'), fallback=average_margin, label='EBIT Margin')
         defaults['EBIT Margin'] = (latest_margin, average_margin)
@@ -1657,7 +1732,11 @@ def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, con
                                                fallback=defaults['D&A % Revenue'], label='Capex')
     defaults['NWC % Revenue'] = first_finite(_historical_mean(stats, 'NWC % Revenue'), fallback=0.0,
                                              label='Working capital')
-    roc = _historical_mean(stats, 'Return on Capital')
+    # Return on new capital: historical return excluding goodwill, since
+    # organic growth doesn't pay acquisition premiums again.
+    roc = (_historical_mean(stats, 'ROC ex Goodwill') if 'ROC ex Goodwill' in stats else np.nan)
+    if not np.isfinite(roc):
+        roc = _historical_mean(stats, 'Return on Capital')
     defaults['Historical ROC'] = roc if np.isfinite(roc) and roc > 0 else None
     return defaults
 
@@ -1815,7 +1894,7 @@ def build_dcf_projections(ltm_revenue, most_recent_date, growth_rates, ebit_marg
 
 
 RONIC_MODES = {
-    "Historical return on capital": "historical",
+    "Historical return on capital (ex goodwill)": "historical",
     "Halfway between historical ROC and WACC": "midpoint",
     "Equal to WACC (no excess returns)": "wacc",
     "Custom": "custom",
@@ -2212,7 +2291,8 @@ def render_historical():
                 # Drivers the DCF projects, each as a share of revenue.
                 st.markdown("### Operating Drivers")
                 driver_columns = ['Revenue Growth', 'Gross Margin', 'EBIT Margin', 'D&A % Revenue',
-                                  'Capex % Revenue', 'NWC % Revenue', 'Eff Tax Rate', 'Return on Capital']
+                                  'Capex % Revenue', 'NWC % Revenue', 'Eff Tax Rate', 'Return on Capital',
+                                  'ROC ex Goodwill']
                 drivers = income_statement[['Total Revenue', 'EBIT']].div(scale_factor).join(df_stats[driver_columns])
                 drivers = dated(drivers.rename(columns={'Total Revenue': f'Revenue ({scale_name})',
                                                         'EBIT': f'EBIT ({scale_name})'}))
@@ -2260,8 +2340,9 @@ def render_historical():
                     st.metric("Average NWC % Revenue", f"{_historical_mean(df_stats, 'NWC % Revenue'):.1%}",
                               help="Sets the working capital each dollar of new revenue ties up")
                 with avg_col4:
-                    st.metric("Average Return on Capital", f"{_historical_mean(df_stats, 'Return on Capital'):.1%}",
-                              help="Default terminal return on new capital")
+                    st.metric("Average ROC ex Goodwill", f"{_historical_mean(df_stats, 'ROC ex Goodwill'):.1%}",
+                              help="Default terminal return on new capital: organic growth doesn't pay acquisition premiums again")
+                    st.caption(f"Including goodwill: {_historical_mean(df_stats, 'Return on Capital'):.1%}")
                 st.caption("Averages use every period shown above. Revenue growth for years 1-2 comes from analyst consensus.")
 
             except Exception as e:
@@ -2393,7 +2474,7 @@ def render_dcf():
     with col_m:
         margin_input = st.text_input(
             "EBIT Margin (%) · year 1, year 2, final year", key="dcf_margin_input",
-            help="Years 1-2 from consensus GAAP EPS where available (else the LTM margin); then a straight line "
+            help="Years 1-2 from consensus EPS on a GAAP basis (adjusted EPS less amortization and stock comp), else the LTM margin; then a straight line "
                  "to the historical average margin."
         )
     st.caption(
@@ -2427,7 +2508,7 @@ def render_dcf():
             ronic_mode = st.selectbox(
                 "Terminal Return on New Capital", options=list(RONIC_MODES), key="dcf_ronic_mode",
                 help="Sets terminal reinvestment = g ÷ RONIC and the final-year capex. Default: the historical "
-                     "average return on capital.",
+                     "average return on capital excluding goodwill.",
             )
             terminal_ronic_input = st.number_input(
                 "Custom Return on New Capital (%)", min_value=0.5, max_value=200.0, step=0.5,

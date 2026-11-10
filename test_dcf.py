@@ -50,6 +50,11 @@ class DefaultsTests(unittest.TestCase):
         self.assertAlmostEqual(defaults['EBIT Margin'][0], 0.90)
         self.assertAlmostEqual(defaults['Capex % Revenue'], 0.07)
 
+    def test_return_on_new_capital_excludes_goodwill(self):
+        stats = self.stats().assign(**{"ROC ex Goodwill": [0.30, 0.40, 0.90]})
+        defaults = app.get_projection_defaults_from_data({'df_stats': stats}, 0.045)
+        self.assertAlmostEqual(defaults['Historical ROC'], 0.35)
+
     def test_perpetual_growth_capped_at_company_growth(self):
         slow = {'growth': (0.02, 0.018), 'margin': None}
         defaults = app.get_projection_defaults_from_data({'df_stats': self.stats()}, 0.045, slow)
