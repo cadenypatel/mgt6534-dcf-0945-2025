@@ -95,9 +95,9 @@ The original Colab notebooks are preserved as reference:
 - Cost of Equity (CAPM): k_E = r_f + β × EMRP
 - Cost of Debt: k_D = r_f + credit_spread
 - NOPAT = EBIT × (1 - Tax Rate)
-- FCF = NOPAT − Reinvestment; reinvestment = ΔRevenue / sales-to-capital (growth-linked, default) or NOPAT × manual rate
-- Perpetual growth default = risk-free rate
-- Terminal Value = NOPAT_final × (1 + g) × (1 - g/RONIC) / (WACC - g), mid-year discounting
+- Unlevered FCF = NOPAT + D&A − Capex − ΔNWC (D&A, capex, NWC as % of revenue)
+- Perpetual growth default = risk-free rate; ERP default = Kroll 5.0%
+- Terminal Value = NOPAT_final × (1 + g) × (1 - g/RONIC) / (WACC - g), mid-year discounting from the valuation date (stub since LTM)
 - Enterprise Value = PV(FCFs) + PV(Terminal Value)
 - Equity Value = Enterprise Value - Debt + Cash + Non-operating Investments - Minority Interest
 - Share Price = Equity Value × FX (statement → quote currency) / Diluted Shares
@@ -135,3 +135,10 @@ The original Colab notebooks are preserved as reference:
 - Sector-fit warnings (`MODEL_FIT_RULES`)
 - Historical tab trimmed to operating drivers, maintenance vs growth capex, and DCF carry-overs; WACC tab to one KPI row
 - `.streamlit/config.toml` pins the light theme
+
+### November 2026: Standard banking DCF
+- Replaced sales-to-capital reinvestment with the explicit UFCF build (`build_dcf_projections`): D&A and capex from LTM intensity, capex moving to the terminal steady state (`steady_state_capex`), ΔNWC from historical NWC % revenue
+- Defaults (`get_projection_defaults_from_data`): consensus growth and GAAP-EPS-implied margins for years 1-2 (`get_consensus_forecast`), straight-line paths (`build_path`) to perpetual growth and historical average margin; same rule for every ticker
+- ERP default Kroll 5.0%; terminal RONIC default = historical average ROC; stub-period discounting (`stub_years`)
+- Data fixes: SEC short-term investments now count as cash (they inflated NWC and invested capital); SEC capex across tags no longer lost to a NaN max; history window and LTM detection no longer hard-coded to 2026
+- `calibrate.py` scores the defaults against market prices across the S&P 100
