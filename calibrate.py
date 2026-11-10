@@ -8,8 +8,9 @@ ticker, because the market prices in views the defaults don't hold.
     python calibrate.py                 # S&P 100
     python calibrate.py AAPL MSFT TXN   # custom tickers
 
-Tickers in sectors flagged by MODEL_FIT_RULES (banks, insurers, REITs, ...)
-are valued but excluded from the summary, since FCFF DCF isn't their method.
+Banks, insurers, lenders and regulated utilities are valued with the equity
+(excess-return) model, as in the app. Remaining poor DCF fits (REITs, oil &
+gas, pre-profit biotech) are valued but excluded from the summary.
 """
 import sys
 import warnings
@@ -33,8 +34,21 @@ HORIZON = 10
 def value(ticker):
     """Default valuation for one ticker, mirroring the WACC and DCF tabs."""
     risk_free, emrp, marginal_tax, rating, _ = app.get_wacc_input_defaults(ticker)
-    wacc = app.compute_wacc(ticker, risk_free, emrp, marginal_tax, rating, "blend")['wacc']
+    capital = app.compute_wacc(ticker, risk_free, emrp, marginal_tax, rating, "blend")
+    wacc = capital['wacc']
     company = app.get_company_market_data(ticker)
+    interest_share = (app.get_financial_company_data(ticker)['net_interest_share']
+                      if company['sector'] == "Financial Services" else None)
+    if app.uses_equity_model(company['sector'], company['industry'], interest_share):
+        data = app.get_financial_company_data(ticker)
+        equity = app.get_financial_defaults(data, company['diluted_shares_outstanding'], company['fx_rate'],
+                                            capital['cost_of_equity'], risk_free)
+        case = {'horizon': HORIZON, 'roe_values': list(equity['roe_values']), 'retention': equity['retention'],
+                'book_per_share': equity['book_per_share']}
+        price = app.run_excess_return_case(case, capital['cost_of_equity'], equity['perpetual_growth'])['share_price']
+        return {'ticker': ticker, 'sector': company['sector'], 'method': 'equity', 'excluded': False,
+                'market': company['current_price'], 'model': price, 'exit_multiple': np.nan,
+                'wacc': capital['cost_of_equity'], 'consensus': data['consensus_eps'] is not None}
     historical = app.get_historical_data(ticker)
     tax_rate = app.get_effective_tax_rate(ticker)
     ltm_revenue, ltm_date = app.get_ltm_revenue(ticker)
@@ -57,7 +71,7 @@ def value(ticker):
     multiple = app.current_ev_to_ebitda(company, historical)
     exit_price = app.exit_multiple_price(valuation, case, wacc, multiple)[0] if multiple else np.nan
     return {
-        'ticker': ticker, 'sector': company['sector'],
+        'ticker': ticker, 'sector': company['sector'], 'method': 'dcf',
         'excluded': app.get_model_fit_warning(company['sector'], company['industry']) is not None,
         'market': company['current_price'], 'model': valuation['share_price'], 'exit_multiple': exit_price,
         'wacc': wacc, 'consensus': consensus is not None,
@@ -101,6 +115,9 @@ def main(tickers):
     by_sector = scored.groupby('sector')['log_ratio'].apply(summarize).unstack()
     print("\nBias by sector (perpetual growth):")
     print(by_sector.sort_values('median_bias').to_string(formatters=formats))
+    by_method = scored.groupby('method')['log_ratio'].apply(summarize).unstack()
+    print("\nBy method:")
+    print(by_method.to_string(formatters=formats))
 
 
 if __name__ == "__main__":

@@ -683,6 +683,7 @@ def get_company_market_data(ticker_symbol):
     # Dilution from options/RSUs/convertibles: the latest quarter's gap between
     # diluted and basic average shares, added to the current basic count.
     dilutive_shares = 0.0
+    reported_diluted_shares = None
     try:
         quarterly_income = ticker.quarterly_income_stmt
         if quarterly_income is not None and not quarterly_income.empty:
@@ -693,6 +694,7 @@ def get_company_market_data(ticker_symbol):
             if not common_dates.empty:
                 latest_date = common_dates.max()
                 dilutive_shares = max(float(diluted[latest_date] - basic[latest_date]), 0.0)
+                reported_diluted_shares = float(diluted[latest_date])
     except Exception:
         dilutive_shares = 0.0
 
@@ -733,6 +735,7 @@ def get_company_market_data(ticker_symbol):
         "shares_outstanding": shares_outstanding,
         "basic_shares_outstanding": shares_outstanding,
         "diluted_shares_outstanding": shares_outstanding + dilutive_shares,
+        "reported_diluted_shares": reported_diluted_shares,
         "total_debt": total_debt if total_debt is not None else 0,
         "total_cash": total_cash if total_cash is not None else 0,
         "non_operating_assets": non_operating_assets,
@@ -1593,6 +1596,20 @@ def calculate_terminal_growth_rate(historical_data, risk_free_rate):
     )
 
 
+def _fiscal_year_remaining(ticker, as_of):
+    """Share of the current fiscal year still ahead of `as_of`: the weight on
+    current-year ("0y") consensus when blending it with next year's ("+1y")
+    into the twelve months after `as_of`."""
+    last_fy_end = ticker.info.get("lastFiscalYearEnd")
+    if not last_fy_end:
+        return 0.5
+    fy_end = pd.Timestamp(last_fy_end, unit="s")
+    as_of = pd.Timestamp(as_of).tz_localize(None)
+    while fy_end <= as_of:
+        fy_end += pd.DateOffset(years=1)
+    return float(np.clip((fy_end - as_of).days / 365.25, 0.0, 1.0))
+
+
 def _non_gaap_adjustment(ticker, income_statement, ltm_revenue, tax_rate, diluted_shares, eps_to_statement=1.0):
     """EBIT margin points to deduct from adjusted (non-GAAP) consensus to put
     it on a GAAP basis: the latest annual amortization of acquired intangibles
@@ -1663,14 +1680,7 @@ def get_consensus_forecast(ticker_symbol, ltm_revenue, ltm_date, historical_data
         if revenue_fy0 is None or revenue_fy1 is None or not ltm_revenue or ltm_revenue <= 0:
             return None
 
-        remaining = 0.5
-        last_fy_end = ticker.info.get("lastFiscalYearEnd")
-        if last_fy_end:
-            fy_end = pd.Timestamp(last_fy_end, unit="s")
-            as_of = pd.Timestamp(ltm_date).tz_localize(None)
-            while fy_end <= as_of:
-                fy_end += pd.DateOffset(years=1)
-            remaining = float(np.clip((fy_end - as_of).days / 365.25, 0.0, 1.0))
+        remaining = _fiscal_year_remaining(ticker, ltm_date)
 
         revenue_y1 = remaining * revenue_fy0 + (1 - remaining) * revenue_fy1
         revenue_y2 = revenue_y1 * revenue_fy1 / revenue_fy0
@@ -1760,7 +1770,22 @@ def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, con
       for terminal reinvestment and steady-state capex.
     """
     stats = historical_data['df_stats'].replace([np.inf, -np.inf], np.nan)
-    defaults = {'_fallback_columns': []}
+    defaults = {'_fallback_columns': [], '_consensus_note': None}
+
+    # Consensus far outside the company's own history (more than 20 points
+    # above its best year or below its worst) usually includes a pending
+    # acquisition or divestiture that the share count and debt don't reflect
+    # yet (e.g., Kimberly-Clark/Kenvue), so it is set aside.
+    history = pd.to_numeric(_annual_rows(stats)['Revenue Growth'], errors='coerce').dropna()
+    if consensus and consensus.get('growth') and len(history):
+        year1 = consensus['growth'][0]
+        if year1 > history.max() + 0.20 or year1 < history.min() - 0.20:
+            defaults['_consensus_note'] = (
+                f"Consensus implies {year1:.0%} year-1 revenue growth vs {history.min():.0%} to {history.max():.0%} "
+                "historically, which usually means a pending acquisition or divestiture that the share count and "
+                "debt don't reflect yet. Historical averages are used instead; override if the deal is in your view."
+            )
+            consensus = None
 
     def first_finite(*values, fallback, label):
         for value in values:
@@ -2288,6 +2313,7 @@ def render_wacc():
                 st.subheader(f"{result['company_name']} ({ticker_symbol})")
                 st.session_state["wacc_calculated_ticker"] = ticker_symbol
                 st.session_state["wacc_calculated_rate"] = wacc
+                st.session_state["wacc_cost_of_equity"] = cost_of_equity
 
                 st.markdown(
                     "<div style='display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin:.5rem 0 1rem'>"
@@ -2461,12 +2487,299 @@ def kpi_card(label, value, note=""):
     return f"<div class='stat-card'><div class='label'>{label}</div><div class='value'>{value}</div>{note_html}</div>"
 
 
+# ============================================================================
+# Financials: excess-return model
+# ============================================================================
+
+VALUATION_METHODS = {
+    "Standard DCF (free cash flow to the firm)": "dcf",
+    "Equity model (ROE vs cost of equity)": "equity",
+}
+
+
+def uses_equity_model(sector, industry, net_interest_share=None):
+    """Companies valued on equity rather than free cash flow:
+    - banks, broker-dealers, insurers, and lenders (credit-services companies
+      earning at least 20% of revenue as net interest income): their debt and
+      cash are operating balances, so free cash flow to the firm is
+      meaningless. Payment networks (Visa) stay on the DCF;
+    - regulated utilities: regulators set an allowed return on equity on the
+      rate base, and heavy approved capex makes free cash flow negative."""
+    industry = (industry or "").lower()
+    if sector == "Utilities":
+        return "renewable" not in industry and "independent power" not in industry
+    if sector != "Financial Services":
+        return False
+    if any(word in industry for word in ("bank", "capital markets", "insurance")):
+        return True
+    return "credit services" in industry and net_interest_share is not None and net_interest_share >= 0.20
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_financial_company_data(ticker_symbol):
+    """Equity-side inputs (financials and utilities): common book value and tangible book
+    (latest quarter), historical ROE (net income ÷ average common equity),
+    net interest income as a share of revenue, dividend payout, and consensus
+    EPS for the next two twelve-month periods."""
+    ticker = yf.Ticker(ticker_symbol)
+    income = ticker.financials.T.sort_index()
+    balance = ticker.balance_sheet.T.sort_index()
+    quarterly = ticker.quarterly_balance_sheet.T.sort_index()
+    latest = quarterly if not quarterly.empty else balance
+    equity_names = ['Common Stock Equity', 'Stockholders Equity']
+    book = _statement_series(latest, equity_names).dropna()
+    if book.empty or book.iloc[-1] <= 0:
+        raise ValueError(f"No positive common equity was returned for {ticker_symbol}.")
+    book_date = book.index[-1]
+    intangibles = _statement_series(latest, ['Goodwill And Other Intangible Assets']).get(book_date, np.nan)
+
+    net_income = _statement_series(income, ['Net Income Common Stockholders', 'Net Income'])
+    annual_equity = _reindex_nearest(_statement_series(balance, equity_names).dropna(), net_income.index)
+    roe = (net_income / annual_equity.rolling(2, min_periods=2).mean()).replace([np.inf, -np.inf], np.nan).dropna()
+
+    revenue = _statement_series(income, ['Total Revenue']).dropna()
+    net_interest = _statement_series(income, ['Net Interest Income']).dropna()
+    net_interest_share = (float(net_interest.iloc[-1] / revenue.iloc[-1])
+                          if not net_interest.empty and not revenue.empty and revenue.iloc[-1] > 0 else None)
+
+    consensus_eps = None
+    try:
+        estimates = pd.to_numeric(ticker.earnings_estimate["avg"], errors="coerce")
+        eps_fy0, eps_fy1 = float(estimates.get("0y")), float(estimates.get("+1y"))
+        if np.isfinite(eps_fy0) and np.isfinite(eps_fy1) and eps_fy0 > 0:
+            remaining = _fiscal_year_remaining(ticker, book_date)
+            eps_y1 = remaining * eps_fy0 + (1 - remaining) * eps_fy1
+            consensus_eps = (eps_y1, eps_y1 * eps_fy1 / eps_fy0)
+    except Exception:
+        pass
+
+    payout = _non_negative_number(ticker.info.get("payoutRatio"))
+    return {
+        'book_equity': float(book.iloc[-1]),
+        'tangible_book': float(book.iloc[-1] - (intangibles if np.isfinite(intangibles) else 0.0)),
+        'book_date': book_date,
+        'historical_roe': roe,
+        'net_interest_share': net_interest_share,
+        'consensus_eps': consensus_eps,
+        'payout': payout if payout is not None and payout <= 1 else None,
+    }
+
+
+def get_financial_defaults(data, shares, fx_rate, cost_of_equity, risk_free_rate):
+    """Excess-return defaults, the same rule for every financial:
+    ROE for years 1-2 = consensus EPS ÷ book value per share, then a straight
+    line to the midpoint of consensus year-2 ROE and the historical average
+    (Yahoo gives only ~3 years of ROE, too short for a through-cycle average
+    alone); earnings retention starts at
+    1 − dividend payout and moves to the steady state (g ÷ ROE); perpetual
+    growth = risk-free rate, capped at cost of equity − MIN_TERMINAL_SPREAD."""
+    book_per_share = data['book_equity'] * fx_rate / shares
+    history = data['historical_roe']
+    average_roe = float(history.mean()) if len(history) else np.nan
+    retention = 1 - (data['payout'] if data['payout'] is not None else 0.3)
+    if data['consensus_eps']:
+        eps_y1, eps_y2 = data['consensus_eps']
+        roe_y1 = eps_y1 / book_per_share
+        roe_y2 = eps_y2 / (book_per_share + eps_y1 * retention)
+        long_run = (roe_y2 + average_roe) / 2 if np.isfinite(average_roe) else roe_y2
+        roe_values = (roe_y1, roe_y2, long_run)
+        source = ('consensus EPS ÷ book value for years 1-2, then halfway between consensus year-2 ROE '
+                  'and the historical average')
+    else:
+        latest = float(history.iloc[-1]) if len(history) else 0.10
+        roe_values = (latest, average_roe if np.isfinite(average_roe) else latest)
+        source = 'latest ROE, then the historical average'
+    perpetual_growth = float(max(min(default_stable_growth(risk_free_rate), cost_of_equity - MIN_TERMINAL_SPREAD), 0.0))
+    return {
+        'book_per_share': book_per_share,
+        'tangible_book_per_share': data['tangible_book'] * fx_rate / shares,
+        'roe_values': roe_values,
+        'retention': float(np.clip(retention, 0.0, 1.0)),
+        'perpetual_growth': perpetual_growth,
+        'average_roe': average_roe,
+        'source': source,
+    }
+
+
+def run_excess_return_case(case, cost_of_equity, terminal_growth, roe_shift=0.0):
+    """Excess-return (residual income) value per share:
+
+    value = book value + Σ (ROE_t − k_e) × BV_(t−1) ÷ (1 + k_e)^t
+            + (ROE_terminal − k_e) × BV_N ÷ (k_e − g) ÷ (1 + k_e)^N
+
+    Book value grows by retained earnings; retention moves to g ÷ ROE so the
+    final year is in steady state. In steady state this is the justified
+    P/B = (ROE − g) ÷ (k_e − g). A company whose final ROE is at or below its
+    cost of equity gets no terminal growth: growing a book that earns less
+    than it costs would destroy value, so it is assumed to stop."""
+    if not np.isfinite(cost_of_equity) or cost_of_equity <= 0:
+        raise ValueError("Cost of equity must be greater than 0%.")
+    if terminal_growth >= cost_of_equity:
+        raise ValueError("Perpetual growth must be lower than the cost of equity.")
+    horizon = case['horizon']
+    roe = [value + roe_shift for value in build_path(case['roe_values'], horizon)]
+    if roe[-1] <= cost_of_equity:
+        terminal_growth = 0.0
+    steady_retention = terminal_growth / roe[-1] if roe[-1] > 0 else 0.0
+    retention = build_path([case['retention'], float(np.clip(steady_retention, 0.0, 1.0))], horizon)
+
+    rows, book, pv_excess = [], case['book_per_share'], 0.0
+    for year in range(horizon):
+        earnings = roe[year] * book
+        excess = (roe[year] - cost_of_equity) * book
+        discount = 1 / (1 + cost_of_equity) ** (year + 1)
+        pv_excess += excess * discount
+        rows.append({'Beginning Book Value': book, 'ROE': roe[year], 'EPS': earnings,
+                     'Equity Charge': cost_of_equity * book, 'Excess Return': excess,
+                     'Retention': retention[year], 'PV of Excess Return': excess * discount})
+        book += earnings * retention[year]
+    terminal_value = (roe[-1] - cost_of_equity) * book / (cost_of_equity - terminal_growth)
+    pv_terminal = terminal_value / (1 + cost_of_equity) ** horizon
+    share_price = case['book_per_share'] + pv_excess + pv_terminal
+    table = pd.DataFrame(rows, index=[f"Year {year + 1}" for year in range(horizon)])
+    return {'share_price': share_price, 'pv_excess': pv_excess, 'pv_terminal': pv_terminal,
+            'terminal_value': terminal_value, 'ending_book': book, 'table': table}
+
+
+def render_equity_model(ticker_symbol, company):
+    """DCF tab, equity model: banks, insurers, lenders, regulated utilities."""
+    st.caption(
+        "**How it works:** value per share = book value + the present value of each year's (ROE − cost of equity) "
+        "× book value. Inputs: cost of equity (CAPM, from the WACC tab), ROE (consensus for years 1-2, then "
+        "long-run), share of earnings retained, and perpetual growth."
+    )
+    try:
+        data = get_financial_company_data(ticker_symbol)
+    except Exception as error:
+        st.error(f"Could not load equity data for {ticker_symbol}: {error}")
+        return
+    shares, fx_rate, price = company['diluted_shares_outstanding'], company['fx_rate'], company['current_price']
+    risk_free_rate = st.session_state.get("wacc_risk_free_rate", 4.5) / 100
+
+    if (st.session_state.get("fin_loaded_ticker") != ticker_symbol
+            or st.session_state.get("dcf_projection_refresh_needed", False)):
+        st.session_state["dcf_projection_refresh_needed"] = False
+        if st.session_state.get("wacc_calculated_ticker") == ticker_symbol and "wacc_cost_of_equity" in st.session_state:
+            cost_of_equity = st.session_state["wacc_cost_of_equity"]
+        else:
+            cost_of_equity = 0.10
+        defaults = get_financial_defaults(data, shares, fx_rate, cost_of_equity, risk_free_rate)
+        st.session_state.update({
+            "fin_loaded_ticker": ticker_symbol,
+            "fin_cost_of_equity": round(cost_of_equity * 100, 2),
+            "fin_growth": round(defaults['perpetual_growth'] * 100, 2),
+            "fin_roe_input": ", ".join(f"{value * 100:.2f}" for value in defaults['roe_values']),
+            "fin_retention": round(defaults['retention'] * 100, 1),
+            "fin_source": defaults['source'],
+        })
+        st.session_state.pop("fin_run_ticker", None)
+    defaults = get_financial_defaults(data, shares, fx_rate, st.session_state["fin_cost_of_equity"] / 100, risk_free_rate)
+
+    st.markdown(f"### Assumptions · {ticker_symbol}")
+    c1, c2, c3, c4 = st.columns(4)
+    cost_of_equity = c1.number_input("Cost of Equity (%)", min_value=1.0, max_value=30.0, step=0.25,
+                                     key="fin_cost_of_equity",
+                                     help="CAPM cost of equity from the WACC tab (financials are valued on equity, "
+                                          "so WACC doesn't apply).") / 100
+    terminal_growth = c2.number_input("Perpetual Growth (%)", step=0.25, key="fin_growth",
+                                      help="Risk-free rate, capped at cost of equity − 3%.") / 100
+    roe_input = c3.text_input("ROE (%) · year 1, year 2, final year", key="fin_roe_input",
+                              help="Years 1-2 = consensus EPS ÷ book value per share; then a straight line to the "
+                                   "historical average ROE.")
+    retention = c4.number_input("Earnings Retained, Year 1 (%)", min_value=0.0, max_value=100.0, step=5.0,
+                                key="fin_retention",
+                                help="1 − dividend payout; moves to the steady state (g ÷ ROE) by the final year.") / 100
+    st.caption(f"ROE: {st.session_state['fin_source']}. Book value per share "
+               f"{defaults['book_per_share']:,.2f} (tangible {defaults['tangible_book_per_share']:,.2f}) as of "
+               f"{pd.Timestamp(data['book_date']):%b %Y}.")
+    with st.expander("Scenarios"):
+        roe_swing = st.number_input("Scenario ROE Swing (± pts)", min_value=0.0, max_value=20.0, value=2.0,
+                                    step=0.5, key="fin_roe_swing") / 100
+    try:
+        roe_values = parse_percent_list(roe_input, "ROE")
+    except ValueError as error:
+        st.error(str(error))
+        return
+    if len(roe_values) > 3:
+        st.error("Enter up to three ROE values.")
+        return
+
+    if st.button("Run Valuation", type="primary", key="fin_run"):
+        st.session_state["fin_run_ticker"] = ticker_symbol
+    if st.session_state.get("fin_run_ticker") != ticker_symbol:
+        return
+
+    case = {'horizon': 10, 'roe_values': roe_values, 'retention': retention,
+            'book_per_share': defaults['book_per_share']}
+    try:
+        scenarios = {name: run_excess_return_case(case, cost_of_equity, terminal_growth, sign * roe_swing)
+                     for name, sign in (("Bear", -1), ("Base", 0), ("Bull", 1))}
+    except ValueError as error:
+        st.error(str(error))
+        return
+    base = scenarios['Base']
+
+    st.divider()
+    st.subheader(f"{company['company_name']} ({ticker_symbol})")
+
+    def vs_market(value):
+        change = value / price - 1
+        color = "var(--teal)" if change >= 0 else "var(--coral)"
+        return f"<span style='color:{color}'>{change:+.1%}</span> vs market"
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.markdown(kpi_card("Market Price", f"${price:,.2f}",
+                         f"P/B {price / defaults['book_per_share']:.2f}x · P/TBV "
+                         f"{price / defaults['tangible_book_per_share']:.2f}x"), unsafe_allow_html=True)
+    for column, name in ((k2, "Bear"), (k3, "Base"), (k4, "Bull")):
+        value = scenarios[name]['share_price']
+        column.markdown(kpi_card(f"{name} Case", f"${value:,.2f}", vs_market(value)), unsafe_allow_html=True)
+    st.caption(f"Bear / bull move every year's ROE ±{roe_swing:.1%}. Implied P/B at base case: "
+               f"{base['share_price'] / defaults['book_per_share']:.2f}x.")
+
+    tab_build, tab_bridge, tab_sens = st.tabs(["Excess Return Build", "Value Bridge", "Sensitivity"])
+    with tab_build:
+        table = base['table'].T
+        percent_rows = ['ROE', 'Retention']
+        st.dataframe(
+            table.style.format("{:.1%}", subset=pd.IndexSlice[percent_rows, :])
+                 .format("{:,.2f}", subset=pd.IndexSlice[[row for row in table.index if row not in percent_rows], :]),
+            width="stretch",
+        )
+        st.caption("Per share. Excess return = (ROE − cost of equity) × beginning book value; book value grows by "
+                   "retained earnings. End-of-year discounting at the cost of equity.")
+    with tab_bridge:
+        bridge = pd.DataFrame({
+            "Item": ["Book value per share", "PV of excess returns (years 1-10)", "PV of terminal excess return",
+                     "Value per share"],
+            "Value": [f"${defaults['book_per_share']:,.2f}", f"${base['pv_excess']:,.2f}",
+                      f"${base['pv_terminal']:,.2f}", f"${base['share_price']:,.2f}"],
+        })
+        st.table(bridge.set_index("Item"))
+        final_roe = build_path(roe_values, 10)[-1]
+        st.caption(f"Terminal = (ROE {final_roe:.1%} − k_e {cost_of_equity:.2%}) × year-10 book value ÷ "
+                   f"(k_e − g {terminal_growth:.2%}). A bank earning exactly its cost of equity is worth book value.")
+    with tab_sens:
+        st.markdown("**Value per share: cost of equity × final-year ROE**")
+        grid = {}
+        for roe_step in (-0.02, -0.01, 0.0, 0.01, 0.02):
+            column = {}
+            for ke_step in (-0.01, -0.005, 0.0, 0.005, 0.01):
+                ke = cost_of_equity + ke_step
+                shifted = dict(case, roe_values=roe_values[:-1] + [roe_values[-1] + roe_step])
+                column[f"{ke:.2%}"] = (run_excess_return_case(shifted, ke, terminal_growth)['share_price']
+                                       if terminal_growth < ke else np.nan)
+            grid[f"ROE {roe_values[-1] + roe_step:.1%}"] = column
+        grid_df = pd.DataFrame(grid)
+        grid_df.index.name = "Cost of equity"
+        st.table(grid_df.style.format("${:,.2f}", na_rep="n/a")
+                 .map(lambda value: "" if pd.isna(value) else
+                      f"background-color: {'#d7eeeb' if value >= price else '#fbe3dd'}"))
+        st.caption(f"Teal above, coral below the market price of ${price:,.2f}.")
+
+
 def render_dcf():
     st.header("DCF Model")
-    st.caption(
-        "Unlevered free cash flow valuation in the standard banking format: consensus for the first two years, "
-        "historical averages after that, a Gordon terminal value cross-checked against an exit multiple."
-    )
 
     if "dcf_wacc_rate" not in st.session_state:
         st.session_state["dcf_wacc_rate"] = 9.0
@@ -2475,6 +2788,43 @@ def render_dcf():
 
     ticker_symbol = st.session_state.get("shared_ticker_symbol", "MSFT").strip().upper()
     risk_free_rate = st.session_state.get("wacc_risk_free_rate", 4.5) / 100
+
+    # Valuation method: auto-selected by sector, editable.
+    try:
+        company = get_company_market_data(ticker_symbol)
+    except Exception as error:
+        st.error(f"Error: {error}")
+        return
+    if st.session_state.get("dcf_method_ticker") != ticker_symbol:
+        interest_share = None
+        if company['sector'] == "Financial Services":
+            try:
+                interest_share = get_financial_company_data(ticker_symbol)['net_interest_share']
+            except Exception:
+                pass
+        equity = uses_equity_model(company['sector'], company['industry'], interest_share)
+        st.session_state["dcf_method"] = list(VALUATION_METHODS)[1 if equity else 0]
+        st.session_state["dcf_method_reason"] = (
+            f"{company['industry'] or company['sector']}: valued on equity, because "
+            + ("regulators set its allowed return on equity and approved capex keeps free cash flow negative."
+               if company['sector'] == "Utilities" else
+               "debt and cash are part of the business (deposits, trading balances, float), so free cash flow "
+               "to the firm is meaningless.")
+            if equity else
+            f"{company['industry'] or company['sector']}: operating company, valued on free cash flow to the firm."
+        )
+        st.session_state["dcf_method_ticker"] = ticker_symbol
+    method_column, _ = st.columns([2, 3])
+    method = method_column.selectbox("Valuation Method", options=list(VALUATION_METHODS), key="dcf_method")
+    st.caption(f"Auto-selected for {st.session_state['dcf_method_reason']}")
+    if VALUATION_METHODS[method] == "equity":
+        render_equity_model(ticker_symbol, company)
+        return
+    st.caption(
+        "**How it works:** revenue × EBIT margin − taxes + D&A − capex − increase in working capital = unlevered "
+        "free cash flow, discounted at WACC, plus a terminal value at perpetual growth. Inputs below: WACC, "
+        "perpetual growth, tax, then revenue growth, EBIT margin, capex, D&A and working capital."
+    )
 
     if (
         st.session_state.get("dcf_tax_ticker") != ticker_symbol
@@ -2525,6 +2875,7 @@ def render_dcf():
             st.session_state["dcf_nwc_input"] = round(defaults['NWC % Revenue'] * 100, 2)
             st.session_state["dcf_growth_source"] = defaults['_growth_source']
             st.session_state["dcf_margin_source"] = defaults['_margin_source']
+            st.session_state["dcf_consensus_note"] = defaults.get('_consensus_note')
 
             st.session_state["dcf_ronic_mode"] = next(iter(RONIC_MODES))
             historical_roc = defaults.get('Historical ROC')
@@ -2593,6 +2944,8 @@ def render_dcf():
             help="Years 1-2 from consensus EPS on a GAAP basis (adjusted EPS less amortization and stock comp), else the LTM margin; then a straight line "
                  "to the historical average margin."
         )
+    if st.session_state.get("dcf_consensus_note"):
+        st.warning(st.session_state["dcf_consensus_note"])
     st.caption(
         f"Growth: {st.session_state.get('dcf_growth_source', 'placeholder')}. "
         f"Margins: {st.session_state.get('dcf_margin_source', 'placeholder')}."
@@ -2726,6 +3079,16 @@ def render_dcf():
         f"{case['shares'] / 1e6:,.1f}M diluted shares"
         + (f" · {company_data['sector']} / {company_data['industry']}" if company_data['sector'] else "")
     )
+    # Shares well above the last filing's count mean a share issuance (often an
+    # acquisition) that the financial statements don't include yet.
+    reported_shares = company_data.get("reported_diluted_shares")
+    if reported_shares and company_data["fx_rate"] == 1.0 and case['shares'] > 1.15 * reported_shares:
+        st.error(
+            f"**Not reliable until the next filing.** Shares outstanding ({case['shares'] / 1e6:,.0f}M) are "
+            f"{case['shares'] / reported_shares - 1:.0%} above the last reported count ({reported_shares / 1e6:,.0f}M), "
+            "usually because an acquisition closed after the latest statements. The price reflects the combined "
+            "company while revenue, margins and debt here do not."
+        )
     fit = get_model_fit_warning(company_data['sector'], company_data['industry'])
     if fit:
         st.warning(f"**DCF is a weak fit here.** {fit[0]} Use {fit[1]} as the primary method and this DCF as a cross-check.")

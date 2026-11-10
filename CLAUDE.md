@@ -153,3 +153,9 @@ The original Colab notebooks are preserved as reference:
 - Perpetual growth capped at WACC − 3% (`MIN_TERMINAL_SPREAD`); captive-finance autos flagged as poor fits
 - `calibrate.py` runs tickers sequentially: yfinance mixes data across threads
 
+### November 2026: Valuation method by sector
+- DCF tab opens with a Valuation Method selector, auto-set by `uses_equity_model`: banks, broker-dealers, insurers, lenders (credit services with net interest income >= 20% of revenue) and regulated utilities use the equity (excess-return) model; everything else uses the standard DCF
+- Equity model (`run_excess_return_case`): value = book value + PV of (ROE − cost of equity) × book value; ROE years 1-2 from consensus EPS ÷ BVPS, then halfway between consensus year-2 ROE and historical average; no terminal growth when ROE <= cost of equity
+- Consensus growth more than 20 pts outside the company's historical range is set aside (pending acquisition/divestiture), with a warning
+- DCF shows an error when shares exceed the last reported diluted count by >15% (acquisition closed after the latest statements, e.g. Kimberly-Clark/Kenvue)
+

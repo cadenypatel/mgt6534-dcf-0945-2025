@@ -72,6 +72,12 @@ class DefaultsTests(unittest.TestCase):
                                                          {'growth': (0.10, 0.08), 'margin': None}, None, 0.06)
         self.assertAlmostEqual(defaults['Perpetual Growth'], 0.03)
 
+    def test_acquisition_step_in_consensus_is_set_aside(self):
+        deal = {'growth': (0.77, 0.70), 'margin': (0.20, 0.21)}
+        defaults = app.get_projection_defaults_from_data({'df_stats': self.stats()}, 0.045, deal)
+        self.assertIsNotNone(defaults['_consensus_note'])
+        self.assertAlmostEqual(defaults['Revenue Growth'][0], 0.15)
+
     def test_perpetual_growth_capped_at_company_growth(self):
         slow = {'growth': (0.02, 0.018), 'margin': None}
         defaults = app.get_projection_defaults_from_data({'df_stats': self.stats()}, 0.045, slow)
@@ -80,6 +86,26 @@ class DefaultsTests(unittest.TestCase):
         defaults = app.get_projection_defaults_from_data({'df_stats': self.stats()}, 0.045, fast)
         self.assertAlmostEqual(defaults['Perpetual Growth'], 0.045)
         self.assertEqual(defaults['EBIT Margin'][:2], (0.30, 0.32))
+
+
+class EquityModelTests(unittest.TestCase):
+    def test_steady_state_matches_justified_price_to_book(self):
+        case = {'horizon': 10, 'roe_values': [0.15], 'retention': 0.03 / 0.15, 'book_per_share': 100.0}
+        value = app.run_excess_return_case(case, 0.10, 0.03)['share_price']
+        self.assertAlmostEqual(value, 100 * (0.15 - 0.03) / (0.10 - 0.03), places=6)
+
+    def test_roe_below_cost_of_equity_gets_no_terminal_growth(self):
+        case = {'horizon': 10, 'roe_values': [0.06], 'retention': 0.5, 'book_per_share': 100.0}
+        result = app.run_excess_return_case(case, 0.10, 0.05)
+        self.assertGreater(result['share_price'], 0)
+        self.assertLess(result['share_price'], 100)
+
+    def test_routing(self):
+        self.assertTrue(app.uses_equity_model("Financial Services", "Banks - Diversified"))
+        self.assertTrue(app.uses_equity_model("Utilities", "Utilities - Regulated Electric"))
+        self.assertTrue(app.uses_equity_model("Financial Services", "Credit Services", 0.8))
+        self.assertFalse(app.uses_equity_model("Financial Services", "Credit Services", -0.02))
+        self.assertFalse(app.uses_equity_model("Technology", "Semiconductors"))
 
 
 class ValuationTests(unittest.TestCase):

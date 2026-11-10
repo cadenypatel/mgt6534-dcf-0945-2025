@@ -26,6 +26,7 @@ Deploy your own instance via [Streamlit Cloud](https://share.streamlit.io)
 - Computes reinvestment rate (CapEx - D&A + ΔNWC) / NOPAT
 
 ### DCF Model
+- Valuation method is chosen by sector and shown at the top of the tab: a standard DCF for operating companies, and an equity (excess-return) model for banks, broker-dealers, insurers, lenders and regulated utilities, where debt and cash are part of the business or returns are set by regulators. Value = book value + PV of (ROE − cost of equity) × book value
 - Standard banking unlevered free cash flow build from LTM (last twelve months) revenue: UFCF = EBIT × (1 − t) + D&A − capex − ΔNWC
 - Revenue growth: analyst consensus for years 1-2, then a straight line to perpetual growth in the final year
 - EBIT margin: years 1-2 backed out of consensus GAAP EPS (else the LTM margin), then a straight line to the historical average
