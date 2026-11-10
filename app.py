@@ -778,6 +778,15 @@ MODEL_FIT_RULES = [
 ]
 
 
+def shares_jumped(company):
+    """True when shares outstanding exceed the last reported diluted count by
+    more than 15%: new shares issued after the latest statements, usually for
+    an acquisition that has closed. (Foreign ADRs are skipped: their reported
+    count is in local shares.)"""
+    reported = company.get("reported_diluted_shares")
+    return bool(reported and company["fx_rate"] == 1.0 and company["diluted_shares_outstanding"] > 1.15 * reported)
+
+
 def get_model_fit_warning(sector, industry):
     """Return (why, better method) when a sector is a poor fit for an FCFF DCF."""
     industry = (industry or "").lower()
@@ -1743,20 +1752,25 @@ def _latest(stats, column):
     return float(values.iloc[-1]) if not values.empty else np.nan
 
 
+# Floor for default perpetual growth: long-run inflation (the Fed's 2%
+# target). A going concern's nominal cash flows keep pace with prices even
+# when its history is flat or shrinking.
+PERPETUAL_GROWTH_FLOOR = 0.02
+
 # Minimum gap between WACC and perpetual growth. A perpetuity priced at a
 # spread under a few points is driven almost entirely by the terminal value.
 MIN_TERMINAL_SPREAD = 0.03
 
 
 def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, consensus=None, industry_margin=None,
-                                      wacc=None):
+                                      wacc=None, deal_closed=False):
     """Default assumptions, built the same way for every ticker.
 
     - Revenue growth: consensus for years 1-2, then a straight line to
       perpetual growth in the final year. Without consensus, the historical
       average growth. Perpetual growth is the risk-free rate, capped at the
       company's last explicit growth rate and at WACC − MIN_TERMINAL_SPREAD,
-      and floored at zero.
+      and floored at long-run inflation (PERPETUAL_GROWTH_FLOOR).
     - EBIT margin: consensus for years 1-2 (from EPS, on a GAAP basis), else
       the LTM margin; then a straight line to the historical average margin.
     - D&A and capex: the LTM share of revenue in year 1. Capex then moves to
@@ -1773,19 +1787,32 @@ def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, con
     defaults = {'_fallback_columns': [], '_consensus_note': None}
 
     # Consensus far outside the company's own history (more than 20 points
-    # above its best year or below its worst) usually includes a pending
-    # acquisition or divestiture that the share count and debt don't reflect
-    # yet (e.g., Kimberly-Clark/Kenvue), so it is set aside.
+    # above its best year or below its worst) usually includes an acquisition
+    # or divestiture (e.g., Kimberly-Clark/Kenvue). The deal is a one-time
+    # step: year 2 returns to the historical average (consensus year 2 would
+    # count the step again). Year 1 takes the full step if the deal has closed
+    # (`deal_closed`: the share count already includes the issued shares),
+    # otherwise the cautious average of consensus and history.
     history = pd.to_numeric(_annual_rows(stats)['Revenue Growth'], errors='coerce').dropna()
     if consensus and consensus.get('growth') and len(history):
         year1 = consensus['growth'][0]
         if year1 > history.max() + 0.20 or year1 < history.min() - 0.20:
+            average_growth = float(history.mean())
+            step = year1 if deal_closed else (year1 + average_growth) / 2
+            blended = {'growth': (step, average_growth), 'margin': None}
+            average_margin_history = _historical_mean(stats, 'EBIT Margin')
+            if consensus.get('margin') and np.isfinite(average_margin_history):
+                blended['margin'] = tuple((value + average_margin_history) / 2 for value in consensus['margin'])
+                blended['margin_basis'] = 'averaged with the historical margin'
             defaults['_consensus_note'] = (
                 f"Consensus implies {year1:.0%} year-1 revenue growth vs {history.min():.0%} to {history.max():.0%} "
-                "historically, which usually means a pending acquisition or divestiture that the share count and "
-                "debt don't reflect yet. Historical averages are used instead; override if the deal is in your view."
+                "historically, which usually reflects an acquisition or divestiture. Year 1 "
+                + ("takes the full step because the deal has closed (the share count already includes it)"
+                   if deal_closed else
+                   f"averages consensus with the historical {average_growth:.1%} as a pending deal")
+                + f" ({step:.1%}); then growth returns to the historical average, since a deal is a one-time step."
             )
-            consensus = None
+            consensus = blended
 
     def first_finite(*values, fallback, label):
         for value in values:
@@ -1808,7 +1835,7 @@ def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, con
     ceiling = default_stable_growth(risk_free_rate)
     if wacc is not None and np.isfinite(wacc):
         ceiling = min(ceiling, wacc - MIN_TERMINAL_SPREAD)
-    defaults['Perpetual Growth'] = float(max(min(explicit_growth[-1], ceiling), 0.0))
+    defaults['Perpetual Growth'] = float(min(max(explicit_growth[-1], PERPETUAL_GROWTH_FLOOR), ceiling))
     defaults['Revenue Growth'] = (*explicit_growth, defaults['Perpetual Growth'])
 
     average_margin = first_finite(_historical_mean(stats, 'EBIT Margin'), fallback=0.15, label='EBIT Margin')
@@ -2855,9 +2882,10 @@ def render_dcf():
                 wacc_for_defaults = st.session_state["wacc_calculated_rate"]
             else:
                 wacc_for_defaults = st.session_state.get("dcf_wacc_rate", 9.0) / 100
+            company_now = get_company_market_data(ticker_symbol)
             defaults = get_projection_defaults_from_data(historical_data, risk_free_rate, consensus,
                                                          get_industry_operating_margin(ticker_symbol),
-                                                         wacc_for_defaults)
+                                                         wacc_for_defaults, shares_jumped(company_now))
             if defaults['_fallback_columns']:
                 st.warning(
                     "Historical data was unavailable for "
@@ -3080,14 +3108,14 @@ def render_dcf():
         + (f" · {company_data['sector']} / {company_data['industry']}" if company_data['sector'] else "")
     )
     # Shares well above the last filing's count mean a share issuance (often an
-    # acquisition) that the financial statements don't include yet.
+    # acquisition) that the latest statements don't include yet.
     reported_shares = company_data.get("reported_diluted_shares")
-    if reported_shares and company_data["fx_rate"] == 1.0 and case['shares'] > 1.15 * reported_shares:
-        st.error(
-            f"**Not reliable until the next filing.** Shares outstanding ({case['shares'] / 1e6:,.0f}M) are "
-            f"{case['shares'] / reported_shares - 1:.0%} above the last reported count ({reported_shares / 1e6:,.0f}M), "
-            "usually because an acquisition closed after the latest statements. The price reflects the combined "
-            "company while revenue, margins and debt here do not."
+    if shares_jumped(company_data):
+        st.warning(
+            f"Shares outstanding ({case['shares'] / 1e6:,.0f}M) are {case['shares'] / reported_shares - 1:.0%} above "
+            f"the last reported count ({reported_shares / 1e6:,.0f}M), likely from an acquisition that closed after "
+            "the latest statements. Debt and cash here are pre-deal; treat the result as a rough estimate until "
+            "the next filing."
         )
     fit = get_model_fit_warning(company_data['sector'], company_data['industry'])
     if fit:

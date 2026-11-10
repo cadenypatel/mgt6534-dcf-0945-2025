@@ -72,16 +72,24 @@ class DefaultsTests(unittest.TestCase):
                                                          {'growth': (0.10, 0.08), 'margin': None}, None, 0.06)
         self.assertAlmostEqual(defaults['Perpetual Growth'], 0.03)
 
-    def test_acquisition_step_in_consensus_is_set_aside(self):
+    def test_acquisition_step_in_consensus_is_averaged_with_history(self):
         deal = {'growth': (0.77, 0.70), 'margin': (0.20, 0.21)}
         defaults = app.get_projection_defaults_from_data({'df_stats': self.stats()}, 0.045, deal)
         self.assertIsNotNone(defaults['_consensus_note'])
-        self.assertAlmostEqual(defaults['Revenue Growth'][0], 0.15)
+        self.assertAlmostEqual(defaults['Revenue Growth'][0], (0.77 + 0.15) / 2)
+        self.assertAlmostEqual(defaults['Revenue Growth'][1], 0.15)
+        self.assertAlmostEqual(defaults['EBIT Margin'][0], (0.20 + 0.25) / 2)
+        closed = app.get_projection_defaults_from_data({'df_stats': self.stats()}, 0.045, deal, deal_closed=True)
+        self.assertAlmostEqual(closed['Revenue Growth'][0], 0.77)
+        self.assertAlmostEqual(closed['Revenue Growth'][1], 0.15)
 
     def test_perpetual_growth_capped_at_company_growth(self):
-        slow = {'growth': (0.02, 0.018), 'margin': None}
+        slow = {'growth': (0.03, 0.028), 'margin': None}
         defaults = app.get_projection_defaults_from_data({'df_stats': self.stats()}, 0.045, slow)
-        self.assertAlmostEqual(defaults['Perpetual Growth'], 0.018)
+        self.assertAlmostEqual(defaults['Perpetual Growth'], 0.028)
+        shrinking = {'growth': (-0.03, -0.02), 'margin': None}
+        defaults = app.get_projection_defaults_from_data({'df_stats': self.stats()}, 0.045, shrinking)
+        self.assertAlmostEqual(defaults['Perpetual Growth'], app.PERPETUAL_GROWTH_FLOOR)
         fast = {'growth': (0.25, 0.20), 'margin': (0.30, 0.32)}
         defaults = app.get_projection_defaults_from_data({'df_stats': self.stats()}, 0.045, fast)
         self.assertAlmostEqual(defaults['Perpetual Growth'], 0.045)

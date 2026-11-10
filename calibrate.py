@@ -55,7 +55,8 @@ def value(ticker):
     consensus = app.get_consensus_forecast(ticker, ltm_revenue, ltm_date, historical, tax_rate,
                                            company['diluted_shares_outstanding'], company['fx_rate'])
     defaults = app.get_projection_defaults_from_data(historical, risk_free, consensus,
-                                                     app.get_industry_operating_margin(ticker), wacc)
+                                                     app.get_industry_operating_margin(ticker), wacc,
+                                                     app.shares_jumped(company))
     growth = defaults['Perpetual Growth']
     ronic = app.resolve_terminal_ronic('historical', wacc, defaults['Historical ROC'])
     case = {
