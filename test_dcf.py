@@ -57,8 +57,8 @@ class ValuationTests(unittest.TestCase):
             app.run_dcf(make_case(), 0.05, 0.05)
 
     def test_perpetual_growth_default(self):
-        self.assertAlmostEqual(app.default_perpetual_growth(0.045, 0.10), 0.045)
-        self.assertAlmostEqual(app.default_perpetual_growth(0.05, 0.06), 0.03)
+        self.assertAlmostEqual(app.default_perpetual_growth(0.10), 0.025)
+        self.assertAlmostEqual(app.default_perpetual_growth(0.05), 0.02)
 
 
 class DefaultsTests(unittest.TestCase):

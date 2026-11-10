@@ -28,7 +28,7 @@ A standard unlevered DCF, the same for every company:
 - Revenue growth: one rate (default: analyst consensus for the next twelve months, else the historical average), stepping down in a straight line to perpetual growth by the final year
 - EBIT margin, D&A, capex and net working capital: one flat % of revenue each (default: historical averages)
 - Unlevered FCF = EBIT × (1 − tax) + D&A − capex − increase in NWC, discounted at WACC (mid-year)
-- Terminal value = final-year FCF × (1 + g) ÷ (WACC − g); perpetual growth defaults to the risk-free rate, kept at least 3 points below WACC
+- Terminal value = final-year FCF × (1 + g) ÷ (WACC − g); perpetual growth defaults to 2.5% (long-run nominal GDP / inflation), kept at least 3 points below WACC
 - Equity value = EV − debt + cash + non-operating investments − minority interest, ÷ diluted shares
 - Bear / base / bull (growth and margin swings), a WACC × growth sensitivity grid, and an exit-multiple (EV/EBITDA) cross-check
 - When consensus shows an acquisition (growth far outside history), the step goes into a pro forma starting revenue rather than the growth rate

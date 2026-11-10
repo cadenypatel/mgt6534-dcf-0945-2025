@@ -80,7 +80,7 @@ The original Colab notebooks are preserved as reference:
 - Cost of Debt: k_D = r_f + credit_spread
 - NOPAT = EBIT × (1 - Tax Rate)
 - Unlevered FCF = NOPAT + D&A − Capex − ΔNWC (flat % of revenue)
-- Perpetual growth default = risk-free rate, at least 3 pts below WACC; ERP default = Kroll 5.0%
+- Perpetual growth default = 2.5% (`PERPETUAL_GROWTH`), at least 3 pts below WACC; ERP default = Kroll 5.0%
 - Terminal Value = UFCF_final × (1 + g) / (WACC − g), mid-year discounting
 - Enterprise Value = PV(FCFs) + PV(Terminal Value)
 - Equity Value = Enterprise Value - Debt + Cash + Non-operating Investments - Minority Interest

@@ -1305,15 +1305,19 @@ def get_historical_data(ticker_symbol):
 # DCF: default assumptions, projections, valuation
 # ============================================================================
 
+# Default perpetual growth: long-run nominal GDP / inflation, the standard
+# 2-3% range used in practice.
+PERPETUAL_GROWTH = 0.025
+
 # Perpetual growth stays at least this far below WACC; a smaller gap makes
 # the terminal value swamp everything else.
 MIN_TERMINAL_SPREAD = 0.03
 
 
-def default_perpetual_growth(risk_free_rate, wacc=None):
-    """Perpetual growth = the risk-free rate (the market's proxy for long-run
-    nominal growth), kept at least MIN_TERMINAL_SPREAD below WACC."""
-    growth = float(risk_free_rate)
+def default_perpetual_growth(wacc=None):
+    """Perpetual growth = PERPETUAL_GROWTH, kept at least MIN_TERMINAL_SPREAD
+    below WACC."""
+    growth = PERPETUAL_GROWTH
     if wacc is not None and np.isfinite(wacc):
         growth = min(growth, wacc - MIN_TERMINAL_SPREAD)
     return max(growth, 0.0)
@@ -1866,7 +1870,6 @@ def kpi_card(label, value, note=""):
 
 def load_dcf_defaults(ticker_symbol):
     """Fill the DCF inputs for a new ticker (or after the WACC tab reruns)."""
-    risk_free_rate = st.session_state.get("wacc_risk_free_rate", 4.5) / 100
     if st.session_state.get("historical_analysis_ticker") == ticker_symbol and \
             st.session_state.get("historical_analysis_data") is not None:
         historical_data = st.session_state["historical_analysis_data"]
@@ -1899,7 +1902,7 @@ def load_dcf_defaults(ticker_symbol):
         "dcf_nwc": round(defaults['NWC % Revenue'] * 100, 2),
         "dcf_tax": round(get_effective_tax_rate(ticker_symbol) * 100, 2),
         "dcf_wacc_rate": round(wacc * 100, 2),
-        "dcf_terminal_growth_rate": round(default_perpetual_growth(risk_free_rate, wacc) * 100, 2),
+        "dcf_terminal_growth_rate": round(default_perpetual_growth(wacc) * 100, 2),
         "dcf_growth_source": defaults['growth_source'],
         "dcf_notes": defaults['notes'],
         "dcf_missing": defaults['missing'],
@@ -1929,8 +1932,8 @@ def render_dcf():
     wacc = c1.number_input("WACC (%)", min_value=1.0, max_value=30.0, step=0.25, key="dcf_wacc_rate",
                            help="From the WACC Calculator tab.") / 100
     terminal_growth = c2.number_input("Perpetual Growth (%)", step=0.25, key="dcf_terminal_growth_rate",
-                                      help="Growth after the forecast, forever: the risk-free rate, kept at least "
-                                           "3 points below WACC.") / 100
+                                      help="Growth after the forecast, forever. Default 2.5% (long-run nominal "
+                                           "GDP / inflation), kept at least 3 points below WACC.") / 100
     tax_rate = c3.number_input("Tax Rate (%)", min_value=0.0, max_value=50.0, step=1.0, key="dcf_tax",
                                help="Median effective tax rate over the company's profitable years.") / 100
     horizon = int(c4.selectbox("Forecast Years", options=["10", "5"], key="dcf_years"))

@@ -45,7 +45,7 @@ def value(ticker):
         'non_operating_assets': company['non_operating_assets'], 'minority_interest': company['minority_interest'],
         'shares': company['diluted_shares_outstanding'], 'fx_rate': company['fx_rate'],
     }
-    valuation = app.run_dcf(case, wacc, app.default_perpetual_growth(risk_free, wacc))
+    valuation = app.run_dcf(case, wacc, app.default_perpetual_growth(wacc))
     multiple = app.current_ev_to_ebitda(company, historical)
     exit_price = app.exit_multiple_price(valuation, case, wacc, multiple)[0] if multiple else np.nan
     return {'ticker': ticker, 'sector': company['sector'], 'industry': company['industry'],
