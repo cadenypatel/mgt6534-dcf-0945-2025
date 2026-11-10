@@ -2050,11 +2050,25 @@ def render_dcf():
         st.table(bridge.set_index("Item"))
         share = base['pv_terminal'] / base['enterprise_value'] if base['enterprise_value'] > 0 else np.nan
         st.caption("$M. " + (f"Terminal value is {share:.0%} of enterprise value." if np.isfinite(share) else ""))
+        st.markdown("**Cross-check: terminal value at an EV/EBITDA multiple**")
         if exit_multiple:
-            exit_price, _ = exit_multiple_price(base, case, wacc, exit_multiple)
-            st.markdown(kpi_card(f"Cross-check: exit at {exit_multiple:.1f}x EV/EBITDA", f"${exit_price:,.2f}",
-                                 "Terminal value set at an EBITDA multiple instead of perpetual growth."),
-                        unsafe_allow_html=True)
+            exit_price, final_ebitda = exit_multiple_price(base, case, wacc, exit_multiple)
+            implied_multiple = base['terminal_value'] / final_ebitda if final_ebitda > 0 else np.nan
+            source = "entered" if st.session_state.get("dcf_exit_multiple") else "today's EV / LTM EBITDA"
+            check = pd.DataFrame({
+                "Item": ["EV/EBITDA multiple used", "Final-year EBITDA", "Terminal value at the multiple",
+                         "Value per share (exit multiple)",
+                         "Multiple implied by perpetual-growth terminal value"],
+                "Value": [f"{exit_multiple:.1f}x ({source})", f"{final_ebitda / 1e6:,.0f}",
+                          f"{final_ebitda * exit_multiple / 1e6:,.0f}", f"${exit_price:,.2f}",
+                          f"{implied_multiple:.1f}x" if np.isfinite(implied_multiple) else "n/m"],
+            })
+            st.table(check.set_index("Item"))
+            st.caption("$M. Same forecast cash flows; only the terminal value changes. If the two multiples are far "
+                       "apart, the market is pricing in more (or less) long-run growth than your perpetual rate.")
+        else:
+            st.caption("Today's EV/EBITDA isn't meaningful (EBITDA negative or above 50x); enter an exit multiple "
+                       "under Scenarios & exit multiple.")
     with tab_sensitivity:
         st.markdown("**Value per share: WACC × perpetual growth**")
         grid = {}
