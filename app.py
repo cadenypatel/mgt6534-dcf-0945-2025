@@ -1585,8 +1585,17 @@ def get_consensus_forecast(ticker_symbol, ltm_revenue, ltm_date, historical_data
         return None
 
 
+def _annual_rows(stats):
+    """Drop a trailing LTM period that overlaps the last fiscal year, so its
+    months aren't counted twice in historical averages."""
+    if len(stats) >= 2 and isinstance(stats.index, pd.DatetimeIndex):
+        if (stats.index[-1] - stats.index[-2]).days < 0.9 * 365.25:
+            return stats.iloc[:-1]
+    return stats
+
+
 def _historical_mean(stats, column):
-    values = pd.to_numeric(stats[column], errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
+    values = pd.to_numeric(_annual_rows(stats)[column], errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
     return float(values.mean()) if not values.empty else np.nan
 
 
