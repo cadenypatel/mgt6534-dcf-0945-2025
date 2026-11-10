@@ -46,26 +46,12 @@ The app (`app.py`) uses a tabbed interface with four sections:
 - Displays capital structure weights and summary table
 
 ### Tab 2: Historical Analysis
-- Inputs: Ticker symbol, display scale
-- Fetches income statement, balance sheet, cash flow statement from yfinance
-- Computes and displays:
-  - Revenue/EBIT growth rates
-  - Gross margin and EBIT margin
-  - NWC and change in NWC
-  - Reinvestment (CapEx - D&A + Change in NWC)
-  - NOPAT and reinvestment rate
-- Shows historical averages for use in projections
+- Annual SEC statements (Yahoo fallback) plus LTM; drivers as % of revenue and the defaults carried into the DCF
 
 ### Tab 3: DCF Model
-- Inputs: Ticker, WACC, terminal growth rate, effective tax rate
-- Projection assumptions: Revenue growth, EBIT margins, reinvestment rates (comma-separated per year)
-- Fetches LTM revenue from quarterly data as starting point
-- Projects Revenue → EBIT → NOPAT → FCF for each year
-- Calculates terminal value via Gordon Growth Model
-- Discounts all cash flows to present value
-- Computes enterprise value, equity value, and implied share price
-- Compares to current market price (upside/downside %)
-- Includes sensitivity analysis for different WACC scenarios
+- Standard unlevered DCF, one method for every company (no sector-specific models)
+- Inputs: WACC, perpetual growth, tax, forecast years, starting revenue, revenue growth (steps down linearly to perpetual growth), and flat EBIT margin, D&A, capex and NWC % of revenue
+- Outputs: bear/base/bull, projections, value bridge with exit-multiple cross-check, WACC × g grid
 
 ## Reference Modules
 
@@ -77,12 +63,10 @@ The original Colab notebooks are preserved as reference:
 
 ## Key Helper Functions in app.py
 
-- `get_credit_spread(rating)`: Looks up credit spread from Damodaran table
-- `calculate_beta(ticker_symbol)`: OLS regression for beta estimation
-- `get_historical_data(ticker_symbol)`: Fetches and processes all financial statements
-- `get_ltm_revenue(ticker_symbol)`: Gets LTM revenue from quarterly data
-- `build_dcf_projections(...)`: Creates projections dataframe with all calculations
-- `calculate_dcf_valuation(...)`: Computes PV of FCFs, terminal value, and share price
+- `get_historical_data(ticker)`: statements and driver ratios (`df_stats`)
+- `get_dcf_defaults(...)`: default inputs (consensus growth, historical-average ratios, pro forma revenue for deals)
+- `growth_path`, `build_projections`, `value_projections`, `run_dcf`: the DCF itself
+- `exit_multiple_price`, `current_ev_to_ebitda`: exit-multiple cross-check
 
 ## External APIs
 
@@ -95,9 +79,9 @@ The original Colab notebooks are preserved as reference:
 - Cost of Equity (CAPM): k_E = r_f + β × EMRP
 - Cost of Debt: k_D = r_f + credit_spread
 - NOPAT = EBIT × (1 - Tax Rate)
-- Unlevered FCF = NOPAT + D&A − Capex − ΔNWC (D&A, capex, NWC as % of revenue)
-- Perpetual growth default = risk-free rate; ERP default = Kroll 5.0%
-- Terminal Value = NOPAT_final × (1 + g) × (1 - g/RONIC) / (WACC - g), mid-year discounting from the valuation date (stub since LTM)
+- Unlevered FCF = NOPAT + D&A − Capex − ΔNWC (flat % of revenue)
+- Perpetual growth default = risk-free rate, at least 3 pts below WACC; ERP default = Kroll 5.0%
+- Terminal Value = UFCF_final × (1 + g) / (WACC − g), mid-year discounting
 - Enterprise Value = PV(FCFs) + PV(Terminal Value)
 - Equity Value = Enterprise Value - Debt + Cash + Non-operating Investments - Minority Interest
 - Share Price = Equity Value × FX (statement → quote currency) / Diluted Shares
@@ -128,34 +112,9 @@ The original Colab notebooks are preserved as reference:
 - Historical Analysis (Tab 2) displays 2026 metrics, NWC changes, and AI infrastructure reinvestment surges.
 - DCF Model (Tab 3) automatically reflects updated 2026 historical averages for revenue growth, margins, and reinvestment rate defaults.
 
-### October 2026: Forward-looking DCF
-- Growth-linked reinvestment via sales-to-capital (replaces history-anchored reinvestment as the default)
-- Three-stage growth: hold consensus year-1 growth for N high-growth years, then fade (`build_growth_path`)
-- Cross-checks: exit EV/EBITDA terminal value, reverse DCF (`solve_implied_growth`), bear/base/bull scenarios, WACC × g grid
-- Sector-fit warnings (`MODEL_FIT_RULES`)
-- Historical tab trimmed to operating drivers, maintenance vs growth capex, and DCF carry-overs; WACC tab to one KPI row
-- `.streamlit/config.toml` pins the light theme
-
-### November 2026: Standard banking DCF
-- Replaced sales-to-capital reinvestment with the explicit UFCF build (`build_dcf_projections`): D&A and capex from LTM intensity, capex moving to the terminal steady state (`steady_state_capex`), ΔNWC from historical NWC % revenue
-- Defaults (`get_projection_defaults_from_data`): consensus growth and GAAP-EPS-implied margins for years 1-2 (`get_consensus_forecast`), straight-line paths (`build_path`) to perpetual growth and historical average margin; same rule for every ticker
-- ERP default Kroll 5.0%; terminal RONIC default = historical average ROC; stub-period discounting (`stub_years`)
-- Data fixes: SEC short-term investments now count as cash (they inflated NWC and invested capital); SEC capex across tags no longer lost to a NaN max; history window and LTM detection no longer hard-coded to 2026
-- `calibrate.py` scores the defaults against market prices across the S&P 100
-
-### November 2026: Audit fixes
-- Share count = max(Yahoo shares, market cap ÷ price): Yahoo counts one class for dual-class stocks (GOOGL, BRK-B, NVO)
-- LTM operating-income scrub is one-sided (only op income far above pretax + interest); investment gains lift pretax legitimately
-- LTM needs four consecutive quarters, else the latest fiscal year is the base
-- Consensus EPS converted to the statement currency for ADRs; EV/EBITDA computed from statements (`current_ev_to_ebitda`), n/m above 50x
-- Tax = median over profitable years, marginal rate for loss histories; RONIC floored at WACC
-- Never-profitable companies converge to Damodaran's industry operating margin (`get_industry_operating_margin`)
-- Perpetual growth capped at WACC − 3% (`MIN_TERMINAL_SPREAD`); captive-finance autos flagged as poor fits
-- `calibrate.py` runs tickers sequentially: yfinance mixes data across threads
-
-### November 2026: Valuation method by sector
-- DCF tab opens with a Valuation Method selector, auto-set by `uses_equity_model`: banks, broker-dealers, insurers, lenders (credit services with net interest income >= 20% of revenue) and regulated utilities use the equity (excess-return) model; everything else uses the standard DCF
-- Equity model (`run_excess_return_case`): value = book value + PV of (ROE − cost of equity) × book value; ROE years 1-2 from consensus EPS ÷ BVPS, then halfway between consensus year-2 ROE and historical average; no terminal growth when ROE <= cost of equity
-- Consensus growth more than 20 pts outside the company's historical range is set aside (pending acquisition/divestiture), with a warning
-- DCF shows an error when shares exceed the last reported diluted count by >15% (acquisition closed after the latest statements, e.g. Kimberly-Clark/Kenvue)
+### November 2026: Simplified standard DCF
+- Rebuilt the DCF as a plain standard model: one growth rate stepping down to perpetual growth, flat ratios, Gordon terminal value on final-year FCF
+- Removed sector-specific models, return-on-capital terminal rules, steady-state capex, non-GAAP consensus conversion, industry margins, and the legacy outlier/recency weighting helpers
+- Kept data fixes: SEC short-term investments as cash, capex across tags, missing operating income filled, partial SEC revenue fallback, dual-class share counts (max of Yahoo shares and market cap ÷ price), consecutive-quarter LTM, one-sided operating-income scrub, statement-based EV/EBITDA
+- `calibrate.py` runs tickers sequentially (yfinance mixes data across threads)
 
