@@ -142,3 +142,14 @@ The original Colab notebooks are preserved as reference:
 - ERP default Kroll 5.0%; terminal RONIC default = historical average ROC; stub-period discounting (`stub_years`)
 - Data fixes: SEC short-term investments now count as cash (they inflated NWC and invested capital); SEC capex across tags no longer lost to a NaN max; history window and LTM detection no longer hard-coded to 2026
 - `calibrate.py` scores the defaults against market prices across the S&P 100
+
+### November 2026: Audit fixes
+- Share count = max(Yahoo shares, market cap ÷ price): Yahoo counts one class for dual-class stocks (GOOGL, BRK-B, NVO)
+- LTM operating-income scrub is one-sided (only op income far above pretax + interest); investment gains lift pretax legitimately
+- LTM needs four consecutive quarters, else the latest fiscal year is the base
+- Consensus EPS converted to the statement currency for ADRs; EV/EBITDA computed from statements (`current_ev_to_ebitda`), n/m above 50x
+- Tax = median over profitable years, marginal rate for loss histories; RONIC floored at WACC
+- Never-profitable companies converge to Damodaran's industry operating margin (`get_industry_operating_margin`)
+- Perpetual growth capped at WACC − 3% (`MIN_TERMINAL_SPREAD`); captive-finance autos flagged as poor fits
+- `calibrate.py` runs tickers sequentially: yfinance mixes data across threads
+

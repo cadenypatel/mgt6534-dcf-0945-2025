@@ -13,7 +13,6 @@ are valued but excluded from the summary, since FCFF DCF isn't their method.
 """
 import sys
 import warnings
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -40,8 +39,9 @@ def value(ticker):
     tax_rate = app.get_effective_tax_rate(ticker)
     ltm_revenue, ltm_date = app.get_ltm_revenue(ticker)
     consensus = app.get_consensus_forecast(ticker, ltm_revenue, ltm_date, historical, tax_rate,
-                                           company['diluted_shares_outstanding'])
-    defaults = app.get_projection_defaults_from_data(historical, risk_free, consensus)
+                                           company['diluted_shares_outstanding'], company['fx_rate'])
+    defaults = app.get_projection_defaults_from_data(historical, risk_free, consensus,
+                                                     app.get_industry_operating_margin(ticker), wacc)
     growth = defaults['Perpetual Growth']
     ronic = app.resolve_terminal_ronic('historical', wacc, defaults['Historical ROC'])
     case = {
@@ -54,8 +54,8 @@ def value(ticker):
         'shares': company['diluted_shares_outstanding'], 'fx_rate': company['fx_rate'],
     }
     valuation = app.run_dcf_case(case, wacc, growth, ronic)
-    exit_price = (app.exit_multiple_price(valuation, case, wacc, company['ev_to_ebitda'])[0]
-                  if company['ev_to_ebitda'] else np.nan)
+    multiple = app.current_ev_to_ebitda(company, historical)
+    exit_price = app.exit_multiple_price(valuation, case, wacc, multiple)[0] if multiple else np.nan
     return {
         'ticker': ticker, 'sector': company['sector'],
         'excluded': app.get_model_fit_warning(company['sector'], company['industry']) is not None,
@@ -82,8 +82,8 @@ def summarize(log_ratio):
 
 
 def main(tickers):
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        results = pd.DataFrame([row for row in pool.map(safe_value, tickers) if row])
+    # One ticker at a time: yfinance mixes data between tickers fetched in parallel.
+    results = pd.DataFrame([row for row in map(safe_value, tickers) if row])
     results['log_ratio'] = np.log(results['model'] / results['market'])
     results['exit_log_ratio'] = np.log(results['exit_multiple'] / results['market'])
     results.to_csv('calibration_results.csv', index=False)

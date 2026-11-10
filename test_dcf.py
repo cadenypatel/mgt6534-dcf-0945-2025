@@ -55,6 +55,23 @@ class DefaultsTests(unittest.TestCase):
         defaults = app.get_projection_defaults_from_data({'df_stats': stats}, 0.045)
         self.assertAlmostEqual(defaults['Historical ROC'], 0.35)
 
+    def test_unprofitable_history_moves_to_industry_margin(self):
+        stats = self.stats().assign(**{"EBIT Margin": [-0.10, -0.05, 0.02]})
+        defaults = app.get_projection_defaults_from_data({'df_stats': stats}, 0.045, None, (0.18, "Software"))
+        self.assertAlmostEqual(defaults['EBIT Margin'][-1], 0.18)
+        profitable = app.get_projection_defaults_from_data({'df_stats': self.stats()}, 0.045, None, (0.18, "Software"))
+        self.assertAlmostEqual(profitable['EBIT Margin'][-1], 0.25)
+
+    def test_return_on_new_capital_floored_at_wacc(self):
+        self.assertAlmostEqual(app.resolve_terminal_ronic("historical", 0.10, 0.02), 0.10)
+        self.assertAlmostEqual(app.resolve_terminal_ronic("historical", 0.10, 0.30), 0.30)
+        self.assertAlmostEqual(app.resolve_terminal_ronic("historical", 0.10, None), 0.10)
+
+    def test_perpetual_growth_keeps_spread_to_wacc(self):
+        defaults = app.get_projection_defaults_from_data({'df_stats': self.stats()}, 0.05,
+                                                         {'growth': (0.10, 0.08), 'margin': None}, None, 0.06)
+        self.assertAlmostEqual(defaults['Perpetual Growth'], 0.03)
+
     def test_perpetual_growth_capped_at_company_growth(self):
         slow = {'growth': (0.02, 0.018), 'margin': None}
         defaults = app.get_projection_defaults_from_data({'df_stats': self.stats()}, 0.045, slow)

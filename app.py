@@ -197,6 +197,35 @@ def get_damodaran_industry_betas():
         return {}
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_damodaran_industry_margins():
+    """Damodaran's latest US industry pre-tax operating margins (unadjusted),
+    keyed by industry name. Empty if his site can't be reached."""
+    try:
+        table = pd.read_html(io.StringIO(_fetch_damodaran(
+            "New_Home_Page/datafile/margin.html").decode("latin-1")))[0]
+        table.columns = table.iloc[1]
+        table = table.iloc[2:]
+        names = table["Industry Name"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+        column = next(c for c in table.columns if "Pre-tax" in str(c) and "Unadjusted" in str(c))
+        margins = pd.to_numeric(table[column].astype(str).str.rstrip("%"), errors="coerce") / 100
+        return {name: float(margin) for name, margin in zip(names, margins)
+                if np.isfinite(margin) and not name.startswith("Total")}
+    except Exception:
+        return {}
+
+
+def get_industry_operating_margin(ticker_symbol):
+    """(industry operating margin, Damodaran industry) for the ticker, or None."""
+    margins = get_damodaran_industry_margins()
+    try:
+        yahoo_industry = yf.Ticker(ticker_symbol).info.get("industry")
+    except Exception:
+        yahoo_industry = None
+    industry = _match_damodaran_industry(yahoo_industry, list(margins))
+    return (margins[industry], industry) if industry else None
+
+
 # Yahoo Finance industry -> Damodaran industry. Unlisted industries fall back
 # to the closest name match.
 YAHOO_TO_DAMODARAN_INDUSTRY = {
@@ -619,6 +648,11 @@ def get_company_market_data(ticker_symbol):
     market_cap = _positive_number(market_cap)
     if market_cap is None and current_price is not None and shares_outstanding is not None:
         market_cap = current_price * shares_outstanding
+    # Yahoo's share count can cover a single class (GOOGL, BRK-B, NVO) while
+    # its market cap covers all classes; market cap ÷ price counts every class
+    # in units of the quoted share.
+    if market_cap is not None and current_price is not None:
+        shares_outstanding = max(shares_outstanding or 0.0, market_cap / current_price)
 
     total_debt = _non_negative_number(ticker_info.get("totalDebt"))
     if (total_debt is None or total_debt == 0) and not balance_sheet.empty:
@@ -732,6 +766,9 @@ MODEL_FIT_RULES = [
     ("Energy", ("oil & gas e&p", "oil & gas integrated", "oil & gas drilling"),
      "Cash flow swings with commodity prices, so the latest year is rarely normal.",
      "this DCF at a mid-cycle commodity price, cross-checked with reserve NAV and EV/EBITDA"),
+    ("Consumer Cyclical", ("auto manufacturers",),
+     "Captive finance arms (e.g., Ford Credit) put customer-loan debt on the consolidated balance sheet.",
+     "the industrial business with its own net debt, plus the finance arm at book value"),
     ("Healthcare", ("biotechnology",),
      "Pre-profit biotech value depends on drug-approval odds, not current cash flow.",
      "risk-adjusted NPV (probability-weighted pipeline)"),
@@ -805,15 +842,21 @@ def get_wacc_input_defaults(ticker_symbol):
 
 
 def get_effective_tax_rate(ticker_symbol):
-    """Normalized effective tax rate: the median of the historical window, so
-    one year's one-off charge or benefit doesn't set the rate forever.
-    Falls back to Yahoo's latest rate, then 21%."""
+    """Normalized effective tax rate: the median over the historical years with
+    positive pretax income, so one year's one-off charge or benefit doesn't
+    set the rate forever. A company with no profitable year pays the marginal
+    rate once it earns money (loss carryforwards are not modeled). Falls back
+    to Yahoo's latest rate, then 21%."""
     try:
-        tax_rates = get_historical_data(ticker_symbol)["df_stats"]["Eff Tax Rate"]
-        tax_rates = tax_rates.replace([np.inf, -np.inf], np.nan).dropna()
-        usable_tax_rates = tax_rates[(tax_rates >= 0) & (tax_rates <= 0.5)]
+        historical = get_historical_data(ticker_symbol)
+        pretax = pd.to_numeric(historical["income_statement"].get("Pretax Income"), errors="coerce")
+        tax_rates = historical["df_stats"]["Eff Tax Rate"].replace([np.inf, -np.inf], np.nan)
+        profitable = tax_rates[(pretax > 0).reindex(tax_rates.index, fill_value=False)].dropna()
+        usable_tax_rates = profitable[(profitable >= 0) & (profitable <= 0.5)]
         if not usable_tax_rates.empty:
             return float(usable_tax_rates.median())
+        if pretax is not None and pretax.notna().any():
+            return MARGINAL_TAX_RATE
     except Exception:
         pass
     try:
@@ -1138,6 +1181,9 @@ def _augment_with_latest_quarterly(ticker_symbol, income_statement, balance_shee
         # A quarter within ~6 weeks of the fiscal year-end is that year's 10-K period.
         if len(rev_quarterly) >= 4 and (annual_max is None or (latest_q - annual_max).days > 45):
             tail_qi = qi.loc[:latest_q].tail(4)
+            if (_statement_series(tail_qi, ['Total Revenue', 'Operating Revenue']).notna().sum() < 4
+                    or (tail_qi.index[-1] - tail_qi.index[0]).days > 300):
+                return income_statement, balance_sheet, cash_flows
             tail_qc = qc.loc[:latest_q].tail(4) if qc is not None and not qc.empty else pd.DataFrame()
             latest_qb = qb.loc[:latest_q].iloc[-1] if qb is not None and not qb.empty else pd.Series()
             df_q = pd.DataFrame([latest_qb]) if not latest_qb.empty else pd.DataFrame()
@@ -1146,13 +1192,14 @@ def _augment_with_latest_quarterly(ticker_symbol, income_statement, balance_shee
             income_statement.loc[latest_q, 'Total Revenue'] = _statement_series(tail_qi, ['Total Revenue', 'Operating Revenue']).sum()
             # Yahoo's quarterly "EBIT" includes non-operating income (investment
             # gains, equity-method income); operating income is the FCFF driver.
-            # A quarter whose operating income is more than 15% of revenue away
-            # from pretax income + interest is a data error; use the rebuild.
+            # A quarter whose operating income exceeds pretax income + interest
+            # by more than 15% of revenue is a data error; use the rebuild. (The
+            # reverse is normal: investment gains lift pretax income.)
             quarter_operating = _statement_series(tail_qi, ['Operating Income', 'EBIT'])
             quarter_rebuilt = (_statement_series(tail_qi, ['Pretax Income'])
                                + _statement_series(tail_qi, ['Interest Expense', 'Interest Expense Non Operating']).abs().fillna(0))
             quarter_revenue = _statement_series(tail_qi, ['Total Revenue', 'Operating Revenue']).abs()
-            inconsistent = (quarter_operating - quarter_rebuilt).abs() > 0.15 * quarter_revenue
+            inconsistent = (quarter_operating - quarter_rebuilt) > 0.15 * quarter_revenue
             ltm_operating_income = quarter_operating.where(~inconsistent, quarter_rebuilt).sum()
             income_statement.loc[latest_q, 'EBIT'] = ltm_operating_income
             if 'Operating Income' in income_statement.columns:
@@ -1546,7 +1593,7 @@ def calculate_terminal_growth_rate(historical_data, risk_free_rate):
     )
 
 
-def _non_gaap_adjustment(ticker, income_statement, ltm_revenue, tax_rate, diluted_shares):
+def _non_gaap_adjustment(ticker, income_statement, ltm_revenue, tax_rate, diluted_shares, eps_to_statement=1.0):
     """EBIT margin points to deduct from adjusted (non-GAAP) consensus to put
     it on a GAAP basis: the latest annual amortization of acquired intangibles
     plus stock compensation, capped at the LTM gap between reported adjusted
@@ -1580,7 +1627,7 @@ def _non_gaap_adjustment(ticker, income_statement, ltm_revenue, tax_rate, dilute
         quarterly = ticker.quarterly_income_stmt.T.sort_index()
         gaap_income = _statement_series(quarterly, ['Net Income', 'Net Income Common Stockholders']).dropna().tail(4)
         if len(adjusted_eps) == 4 and len(gaap_income) == 4:
-            gap = adjusted_eps.sum() * diluted_shares - gaap_income.sum()
+            gap = adjusted_eps.sum() * diluted_shares * eps_to_statement - gaap_income.sum()
             measured = max(float(gap), 0.0) / (1 - tax_rate) / ltm_revenue
     except Exception:
         pass
@@ -1593,7 +1640,7 @@ def _non_gaap_adjustment(ticker, income_statement, ltm_revenue, tax_rate, dilute
 
 
 def get_consensus_forecast(ticker_symbol, ltm_revenue, ltm_date, historical_data=None, tax_rate=None,
-                           diluted_shares=None):
+                           diluted_shares=None, fx_rate=1.0):
     """Analyst consensus for forecast years 1 and 2, aligned to the LTM date.
 
     Consensus is published per fiscal year (current "0y" and next "+1y"). Year 1
@@ -1605,7 +1652,9 @@ def get_consensus_forecast(ticker_symbol, ltm_revenue, ltm_date, historical_data
     intangibles and stock compensation are charged back, but never more than
     the gap the company actually reported between adjusted and GAAP earnings
     over the LTM. Returns a dict with 'growth' (y1, y2) and 'margin' (y1, y2)
-    or None for either, or None if there is no revenue consensus.
+    or None for either, or None if there is no revenue consensus. EPS quoted
+    in another currency than revenue (ADRs) is converted with `fx_rate`
+    (quote currency per statement currency).
     """
     try:
         ticker = yf.Ticker(ticker_symbol)
@@ -1630,19 +1679,26 @@ def get_consensus_forecast(ticker_symbol, ltm_revenue, ltm_date, historical_data
         try:
             eps = ticker.earnings_estimate
             gaap = "methodology" not in eps or str(eps["methodology"].get("0y", "gaap")).lower() == "gaap"
+            eps_currency = str(eps["currency"].get("0y", "")) if "currency" in eps else ""
+            revenue_currency = (str(ticker.revenue_estimate["currency"].get("0y", ""))
+                                if "currency" in ticker.revenue_estimate else "")
+            eps_to_statement = (1 / fx_rate if eps_currency and revenue_currency and eps_currency != revenue_currency
+                                and fx_rate else 1.0)
             eps_fy0 = float(pd.to_numeric(eps["avg"], errors="coerce").get("0y"))
             eps_fy1 = float(pd.to_numeric(eps["avg"], errors="coerce").get("+1y"))
             income = historical_data['income_statement'] if historical_data else None
             ebit_ltm = float(income['EBIT'].dropna().iloc[-1])
             pretax_ltm = float(pd.to_numeric(income['Pretax Income'], errors="coerce").dropna().iloc[-1])
             ebit_to_pretax = ebit_ltm / pretax_ltm
-            adjustment = 0.0 if gaap else _non_gaap_adjustment(ticker, income, ltm_revenue, tax_rate, diluted_shares)
+            adjustment = 0.0 if gaap else _non_gaap_adjustment(ticker, income, ltm_revenue, tax_rate, diluted_shares,
+                                                               eps_to_statement)
             if (adjustment is not None and eps_fy0 > 0 and eps_fy1 > 0 and diluted_shares
                     and tax_rate is not None and 0.5 < ebit_to_pretax < 2.0):
                 eps_y1 = remaining * eps_fy0 + (1 - remaining) * eps_fy1
                 eps_y2 = eps_y1 * eps_fy1 / eps_fy0
                 margins = tuple(
-                    eps_value * diluted_shares / (1 - tax_rate) * ebit_to_pretax / revenue_value - adjustment
+                    eps_value * eps_to_statement * diluted_shares / (1 - tax_rate) * ebit_to_pretax / revenue_value
+                    - adjustment
                     for eps_value, revenue_value in ((eps_y1, revenue_y1), (eps_y2, revenue_y2))
                 )
                 if all(-0.5 < margin < 0.8 for margin in margins):
@@ -1677,17 +1733,28 @@ def _latest(stats, column):
     return float(values.iloc[-1]) if not values.empty else np.nan
 
 
-def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, consensus=None):
+# Minimum gap between WACC and perpetual growth. A perpetuity priced at a
+# spread under a few points is driven almost entirely by the terminal value.
+MIN_TERMINAL_SPREAD = 0.03
+
+
+def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, consensus=None, industry_margin=None,
+                                      wacc=None):
     """Default assumptions, built the same way for every ticker.
 
     - Revenue growth: consensus for years 1-2, then a straight line to
       perpetual growth in the final year. Without consensus, the historical
       average growth. Perpetual growth is the risk-free rate, capped at the
-      company's last explicit growth rate and floored at zero.
+      company's last explicit growth rate and at WACC − MIN_TERMINAL_SPREAD,
+      and floored at zero.
     - EBIT margin: consensus for years 1-2 (from EPS, on a GAAP basis), else
       the LTM margin; then a straight line to the historical average margin.
     - D&A and capex: the LTM share of revenue in year 1. Capex then moves to
       the steady-state level the terminal value assumes (set at run time).
+    - A company with no profitable history (average margin at or below
+      zero) moves to its industry's operating margin instead
+      (`industry_margin`, (margin, industry) from Damodaran), the standard
+      treatment for young companies.
     - Working capital: the historical average share of revenue.
     - Return on new capital: the historical average excluding goodwill, used
       for terminal reinvestment and steady-state capex.
@@ -1711,19 +1778,28 @@ def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, con
         defaults['_growth_source'] = 'historical average growth (no analyst consensus), then a straight line to perpetual growth'
     # Perpetual growth: the risk-free rate (nominal-economy proxy), but never
     # above the company's own last explicit growth, so a slow grower's path
-    # doesn't climb into the terminal value.
-    defaults['Perpetual Growth'] = float(np.clip(explicit_growth[-1], 0.0, default_stable_growth(risk_free_rate)))
+    # doesn't climb into the terminal value, and never within a few points of
+    # WACC (heavily levered companies have WACCs near the risk-free rate).
+    ceiling = default_stable_growth(risk_free_rate)
+    if wacc is not None and np.isfinite(wacc):
+        ceiling = min(ceiling, wacc - MIN_TERMINAL_SPREAD)
+    defaults['Perpetual Growth'] = float(max(min(explicit_growth[-1], ceiling), 0.0))
     defaults['Revenue Growth'] = (*explicit_growth, defaults['Perpetual Growth'])
 
     average_margin = first_finite(_historical_mean(stats, 'EBIT Margin'), fallback=0.15, label='EBIT Margin')
+    margin_target = 'the historical average'
+    if average_margin <= 0 and industry_margin:
+        average_margin, industry = industry_margin
+        margin_target = f'the {industry} industry margin (no profitable history)'
+    defaults['_margin_target'] = margin_target
     if consensus and consensus.get('margin'):
         defaults['EBIT Margin'] = (*consensus['margin'], average_margin)
         defaults['_margin_source'] = (f"consensus EPS ({consensus.get('margin_basis', 'GAAP')}) for years 1-2, "
-                                      "then the historical average")
+                                      f"then {margin_target}")
     else:
         latest_margin = first_finite(_latest(stats, 'EBIT Margin'), fallback=average_margin, label='EBIT Margin')
         defaults['EBIT Margin'] = (latest_margin, average_margin)
-        defaults['_margin_source'] = 'LTM margin, then the historical average'
+        defaults['_margin_source'] = f'LTM margin, then {margin_target}'
 
     defaults['D&A % Revenue'] = first_finite(_latest(stats, 'D&A % Revenue'), _historical_mean(stats, 'D&A % Revenue'),
                                              fallback=0.04, label='D&A')
@@ -1743,7 +1819,8 @@ def get_projection_defaults_from_data(historical_data, risk_free_rate=0.045, con
 
 def get_projection_defaults(ticker_symbol, risk_free_rate=0.045, consensus=None):
     """Fetch and return projection assumptions for a ticker."""
-    return get_projection_defaults_from_data(get_historical_data(ticker_symbol), risk_free_rate, consensus)
+    return get_projection_defaults_from_data(get_historical_data(ticker_symbol), risk_free_rate, consensus,
+                                             get_industry_operating_margin(ticker_symbol))
 
 
 def parse_percent_list(raw_value, label):
@@ -1827,10 +1904,17 @@ def get_ltm_revenue(ticker_symbol):
         raise ValueError(f"No usable revenue history was returned for {ticker_symbol}.")
 
     revenue = revenue.tail(4)
-    if len(revenue) < 4:
+    if len(revenue) < 4 or (revenue.index[-1] - revenue.index[0]).days > 300:
+        # A missing quarter would stretch "LTM" over five quarters; start
+        # from the latest full fiscal year instead.
+        try:
+            annual = pd.to_numeric(ticker.financials.T.sort_index()["Total Revenue"], errors="coerce").dropna()
+            if not annual.empty and annual.iloc[-1] > 0:
+                return float(annual.iloc[-1]), annual.index[-1]
+        except Exception:
+            pass
         raise ValueError(
-            f"Only {len(revenue)} usable quarters of revenue data were returned for {ticker_symbol}; "
-            "four quarters are required for LTM revenue."
+            f"Yahoo did not return four consecutive quarters or an annual revenue figure for {ticker_symbol}."
         )
 
     ltm_revenue = float(revenue.sum())
@@ -1903,14 +1987,16 @@ RONIC_MODES = {
 
 def resolve_terminal_ronic(mode, wacc, historical_roc, custom_value=None):
     """Terminal return on new invested capital for a RONIC_MODES choice.
-    Modes that need history fall back to WACC when it isn't usable."""
+    Modes that need history fall back to WACC when it isn't usable, and are
+    floored at WACC: a steady-state company doesn't keep investing below its
+    cost of capital (that history usually reflects start-up losses)."""
     usable_roc = historical_roc if historical_roc is not None and np.isfinite(historical_roc) and historical_roc > 0 else None
     if mode == "custom" and custom_value:
         return float(custom_value)
     if mode == "historical" and usable_roc is not None:
-        return float(usable_roc)
+        return float(max(usable_roc, wacc))
     if mode == "midpoint" and usable_roc is not None:
-        return float((usable_roc + wacc) / 2)
+        return float(max((usable_roc + wacc) / 2, wacc))
     return float(wacc)
 
 
@@ -1998,6 +2084,23 @@ def run_dcf_case(case, wacc, terminal_growth, ronic, growth_shift=0.0, margin_sh
     terminal_reinvestment = get_terminal_reinvestment_rate(terminal_growth, ronic)
     return calculate_dcf_valuation(projections, wacc, terminal_growth, terminal_reinvestment, case,
                                    stub=case.get('stub', 0.0))
+
+
+def current_ev_to_ebitda(company, historical_data):
+    """Today's EV / LTM EBITDA, built in the statement currency from market cap,
+    debt, cash and the LTM statements (Yahoo's ratio mixes currencies for
+    foreign filers). None when EBITDA isn't positive or the multiple is above
+    50x: near-zero EBITDA makes it meaningless as an exit multiple."""
+    try:
+        income = historical_data['income_statement']
+        ebitda = float(income['EBIT'].dropna().iloc[-1]
+                       + historical_data['merged_cf']['Depreciation And Amortization'].dropna().iloc[-1])
+        enterprise_value = (company['market_cap'] / company['fx_rate'] + company['total_debt']
+                            - company['total_cash'] + company['minority_interest'] - company['non_operating_assets'])
+        multiple = enterprise_value / ebitda if ebitda > 0 and enterprise_value > 0 else None
+        return multiple if multiple is not None and multiple <= 50 else None
+    except Exception:
+        return None
 
 
 def exit_multiple_price(valuation, case, wacc, exit_multiple):
@@ -2391,12 +2494,20 @@ def render_dcf():
                 return
             try:
                 ltm_revenue, ltm_date = get_ltm_revenue(ticker_symbol)
-                shares = get_company_market_data(ticker_symbol)["diluted_shares_outstanding"]
+                company = get_company_market_data(ticker_symbol)
                 consensus = get_consensus_forecast(ticker_symbol, ltm_revenue, ltm_date, historical_data,
-                                                   tax_rate, shares)
+                                                   tax_rate, company["diluted_shares_outstanding"], company["fx_rate"])
+                st.session_state["dcf_current_multiple"] = current_ev_to_ebitda(company, historical_data)
             except Exception:
                 consensus = None
-            defaults = get_projection_defaults_from_data(historical_data, risk_free_rate, consensus)
+                st.session_state["dcf_current_multiple"] = None
+            if st.session_state.get("wacc_calculated_ticker") == ticker_symbol:
+                wacc_for_defaults = st.session_state["wacc_calculated_rate"]
+            else:
+                wacc_for_defaults = st.session_state.get("dcf_wacc_rate", 9.0) / 100
+            defaults = get_projection_defaults_from_data(historical_data, risk_free_rate, consensus,
+                                                         get_industry_operating_margin(ticker_symbol),
+                                                         wacc_for_defaults)
             if defaults['_fallback_columns']:
                 st.warning(
                     "Historical data was unavailable for "
@@ -2439,7 +2550,7 @@ def render_dcf():
         terminal_growth = st.number_input(
             "Perpetual Growth (%)", step=0.25, key="dcf_terminal_growth_rate",
             help="Growth after the forecast, forever. Defaults to the risk-free rate (long-run nominal "
-                 "growth proxy), capped at the company's consensus year-2 growth; must stay below WACC."
+                 "growth proxy), capped at the company's consensus year-2 growth and at WACC − 3%."
         ) / 100
     with col3:
         tax_rate = st.number_input(
@@ -2454,6 +2565,11 @@ def render_dcf():
     if terminal_growth >= wacc:
         st.error("Perpetual growth must be below WACC; otherwise the terminal value is infinite.")
         return
+    if terminal_growth > wacc - MIN_TERMINAL_SPREAD + 0.0001:
+        st.warning(
+            f"Perpetual growth ({terminal_growth:.2%}) is within {MIN_TERMINAL_SPREAD:.0%} of WACC ({wacc:.2%}); "
+            "the terminal value will dominate and swing sharply with small changes."
+        )
     if terminal_growth > default_stable_growth(risk_free_rate) + 0.0001:
         st.warning(
             f"Perpetual growth ({terminal_growth:.2%}) is above the risk-free rate ({risk_free_rate:.2%}), "
@@ -2698,7 +2814,7 @@ def render_dcf():
         )
 
     with tab_checks:
-        exit_multiple = exit_multiple_input or company_data.get("ev_to_ebitda")
+        exit_multiple = exit_multiple_input or st.session_state.get("dcf_current_multiple")
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("**Exit-multiple terminal value**")
@@ -2715,7 +2831,8 @@ def render_dcf():
                     "your perpetual rate, or today's multiple won't hold."
                 )
             else:
-                st.caption("No EV/EBITDA available; enter an exit multiple under assumptions.")
+                st.caption("Today's EV/EBITDA isn't meaningful (EBITDA near zero or negative); enter a mature-peer "
+                           "exit multiple under assumptions.")
         with c2:
             st.markdown("**Reverse DCF: what the price implies**")
             base_growth = growth_values[0]

@@ -30,7 +30,8 @@ Deploy your own instance via [Streamlit Cloud](https://share.streamlit.io)
 - Revenue growth: analyst consensus for years 1-2, then a straight line to perpetual growth in the final year
 - EBIT margin: years 1-2 backed out of consensus GAAP EPS (else the LTM margin), then a straight line to the historical average
 - D&A and capex start at their LTM share of revenue; capex moves to the steady-state level the terminal value assumes (capex − D&A + ΔNWC = g ÷ return on new capital × NOPAT); working capital uses its historical average share of revenue
-- Perpetual growth defaults to the risk-free rate (long-run nominal growth proxy) and must stay below WACC
+- Perpetual growth defaults to the risk-free rate (long-run nominal growth proxy), capped at the company's consensus year-2 growth and at WACC − 3%
+- Companies with no profitable history converge to their industry's operating margin (Damodaran); return on new capital excludes goodwill and is floored at WACC
 - Terminal value via Gordon Growth with reinvestment g / RONIC (RONIC defaults to historical average return on capital); mid-year discounting from today, with the stub period since the LTM date
 - Cross-checks: exit-multiple terminal value (EV/EBITDA) and a reverse DCF that solves for the market-implied year-1 growth
 - Separate bear / base / bull prices (growth and margin swings, not averaged) and a WACC × perpetual-growth sensitivity grid
