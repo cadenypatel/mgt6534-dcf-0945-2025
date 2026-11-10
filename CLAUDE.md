@@ -42,7 +42,6 @@ The app (`app.py`) uses a tabbed interface with four sections:
 - Inputs: Ticker symbol, risk-free rate, EMRP, credit rating, tax rate
 - Beta: average of Blume-adjusted OLS regression (5-year monthly vs S&P 500) and Damodaran bottom-up industry beta (selectable)
 - ERP, industry betas, and credit spreads fetched live from Damodaran's site (cached daily, stored fallbacks)
-- Beta, risk-free rate, ERP, spread, marginal tax rate, market capitalization, and debt are editable
 - Computes cost of equity (CAPM), cost of debt, and WACC
 - Displays capital structure weights and summary table
 
@@ -58,17 +57,15 @@ The app (`app.py`) uses a tabbed interface with four sections:
 - Shows historical averages for use in projections
 
 ### Tab 3: DCF Model
-- Inputs: Ticker, WACC, terminal growth rate, effective tax rate, LTM revenue, and editable equity-bridge figures
-- Bear, base, and best cases use editable revenue growth, EBIT margins, and reinvestment rates held constant over the forecast
-- Base defaults use unweighted annual historical means; overlapping LTM observations are excluded
-- Default bear and best cases apply editable changes to growth, margin, and reinvestment around the base; custom case assumptions remain editable
+- Inputs: Ticker, WACC, terminal growth rate, effective tax rate
+- Projection assumptions: Revenue growth, EBIT margins, reinvestment rates (comma-separated per year)
 - Fetches LTM revenue from quarterly data as starting point
 - Projects Revenue → EBIT → NOPAT → FCF for each year
 - Calculates terminal value via Gordon Growth Model
 - Discounts all cash flows to present value
 - Computes enterprise value, equity value, and implied share price
 - Compares to current market price (upside/downside %)
-- Displays each scenario's implied price and a selectable forecast and equity-value bridge
+- Includes sensitivity analysis for different WACC scenarios
 
 ## Reference Modules
 
@@ -98,8 +95,9 @@ The original Colab notebooks are preserved as reference:
 - Cost of Equity (CAPM): k_E = r_f + β × EMRP
 - Cost of Debt: k_D = r_f + credit_spread
 - NOPAT = EBIT × (1 - Tax Rate)
-- FCF = NOPAT × (1 - Reinvestment Rate)
-- Terminal Value = FCF_final × (1 + g) / (WACC - g), mid-year discounting
+- Unlevered FCF = NOPAT + D&A − Capex − ΔNWC (D&A, capex, NWC as % of revenue)
+- Perpetual growth default = risk-free rate; ERP default = Kroll 5.0%
+- Terminal Value = NOPAT_final × (1 + g) × (1 - g/RONIC) / (WACC - g), mid-year discounting from the valuation date (stub since LTM)
 - Enterprise Value = PV(FCFs) + PV(Terminal Value)
 - Equity Value = Enterprise Value - Debt + Cash + Non-operating Investments - Minority Interest
 - Share Price = Equity Value × FX (statement → quote currency) / Diluted Shares
@@ -129,3 +127,18 @@ The original Colab notebooks are preserved as reference:
   - Dynamically aligned column discrepancies between SEC XBRL and Yahoo statements.
 - Historical Analysis (Tab 2) displays 2026 metrics, NWC changes, and AI infrastructure reinvestment surges.
 - DCF Model (Tab 3) automatically reflects updated 2026 historical averages for revenue growth, margins, and reinvestment rate defaults.
+
+### October 2026: Forward-looking DCF
+- Growth-linked reinvestment via sales-to-capital (replaces history-anchored reinvestment as the default)
+- Three-stage growth: hold consensus year-1 growth for N high-growth years, then fade (`build_growth_path`)
+- Cross-checks: exit EV/EBITDA terminal value, reverse DCF (`solve_implied_growth`), bear/base/bull scenarios, WACC × g grid
+- Sector-fit warnings (`MODEL_FIT_RULES`)
+- Historical tab trimmed to operating drivers, maintenance vs growth capex, and DCF carry-overs; WACC tab to one KPI row
+- `.streamlit/config.toml` pins the light theme
+
+### November 2026: Standard banking DCF
+- Replaced sales-to-capital reinvestment with the explicit UFCF build (`build_dcf_projections`): D&A and capex from LTM intensity, capex moving to the terminal steady state (`steady_state_capex`), ΔNWC from historical NWC % revenue
+- Defaults (`get_projection_defaults_from_data`): consensus growth and GAAP-EPS-implied margins for years 1-2 (`get_consensus_forecast`), straight-line paths (`build_path`) to perpetual growth and historical average margin; same rule for every ticker
+- ERP default Kroll 5.0%; terminal RONIC default = historical average ROC; stub-period discounting (`stub_years`)
+- Data fixes: SEC short-term investments now count as cash (they inflated NWC and invested capital); SEC capex across tags no longer lost to a NaN max; history window and LTM detection no longer hard-coded to 2026
+- `calibrate.py` scores the defaults against market prices across the S&P 100

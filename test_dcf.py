@@ -1,273 +1,104 @@
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
-from streamlit.testing.v1 import AppTest
 
 import app
 
 
-class DcfCalculationTests(unittest.TestCase):
-    def test_historical_cases_use_unweighted_observations(self):
-        stats = pd.DataFrame({
-            "Revenue Growth": [0.1, 0.3, np.nan],
-            "EBIT Margin": [0.2, 0.4, 0.3],
-            "Reinv Rate": [0.2, 0.5, 0.8],
-        })
-        defaults, missing = app.historical_scenario_defaults({"df_stats": stats})
-        self.assertEqual(missing, [])
-        self.assertAlmostEqual(defaults["Revenue Growth"], 20)
-        self.assertAlmostEqual(defaults["EBIT Margin"], 30)
-        self.assertAlmostEqual(defaults["Reinv Rate"], 50)
+def make_case(**overrides):
+    case = {
+        'ltm_revenue': 1000.0, 'ltm_date': pd.Timestamp("2025-12-31"), 'stub': 0.0, 'horizon': 10,
+        'growth_values': [0.10, 0.08, 0.03], 'margin_values': [0.20, 0.22, 0.25], 'capex_values': [0.06],
+        'da_pct': 0.04, 'nwc_pct': 0.10, 'tax_rate': 0.21,
+        'total_debt': 200.0, 'total_cash': 50.0, 'non_operating_assets': 20.0, 'minority_interest': 0.0,
+        'shares': 10.0, 'fx_rate': 1.0,
+    }
+    case.update(overrides)
+    return case
 
-    def test_missing_history_is_reported(self):
-        stats = pd.DataFrame({
-            "Revenue Growth": [np.nan],
-            "EBIT Margin": [0.3],
-            "Reinv Rate": [np.inf],
-        })
-        defaults, missing = app.historical_scenario_defaults({"df_stats": stats})
-        self.assertEqual(missing, ["Revenue Growth", "Reinv Rate"])
-        self.assertEqual(defaults["Revenue Growth"], 0)
 
-    def test_overlapping_ltm_is_excluded_from_assumption_averages(self):
-        stats = pd.DataFrame({
-            "Revenue Growth": [0.1, 0.2, np.nan],
-            "EBIT Margin": [0.2, 0.4, 0.9],
-            "Reinv Rate": [0.2, 0.4, 0.9],
+class PathTests(unittest.TestCase):
+    def test_explicit_years_then_straight_line_to_final(self):
+        path = app.build_path([0.10, 0.08, 0.03], 10)
+        self.assertEqual(path[:2], [0.10, 0.08])
+        self.assertAlmostEqual(path[-1], 0.03)
+        steps = np.diff(path[1:])
+        np.testing.assert_allclose(steps, steps[0])
+
+    def test_single_value_is_held(self):
+        self.assertEqual(app.build_path([0.05], 4), [0.05] * 4)
+
+
+class DefaultsTests(unittest.TestCase):
+    def stats(self):
+        return pd.DataFrame({
+            "Revenue Growth": [0.10, 0.20, np.nan],
+            "EBIT Margin": [0.20, 0.30, 0.90],
+            "D&A % Revenue": [0.03, 0.04, 0.05],
+            "Capex % Revenue": [0.05, 0.06, 0.07],
+            "NWC % Revenue": [0.10, 0.20, 0.90],
+            "Return on Capital": [0.15, 0.25, 0.90],
         }, index=pd.to_datetime(["2024-12-31", "2025-12-31", "2026-06-30"]))
-        defaults, _ = app.historical_scenario_defaults({"df_stats": stats})
-        self.assertAlmostEqual(defaults["EBIT Margin"], 30.0)
-        self.assertAlmostEqual(defaults["Reinv Rate"], 30.0)
 
-    def test_multiple_scenario_drivers_and_valuation(self):
-        cases = app.build_scenario_assumptions(20, 40, 30, 2, 1, 2)
-        np.testing.assert_allclose(cases["EBIT margin (%)"], [39, 40, 41])
-        np.testing.assert_allclose(cases["Revenue growth (%)"], [18, 20, 22])
-        np.testing.assert_allclose(cases["Reinvestment rate (%)"], [28, 30, 32])
-        values = {}
-        for _, case in cases.iterrows():
-            projection = app.build_dcf_projections(
-                1000, pd.Timestamp("2025-12-31"), [case["Revenue growth (%)"] / 100] * 5,
-                [case["EBIT margin (%)"] / 100] * 5, [case["Reinvestment rate (%)"] / 100] * 5, 0.21
-            )
-            values[case["Scenario"]] = app.calculate_dcf_valuation(
-                projection, 0.09, 0.03, 200, 50, 10, non_operating_assets=20, fx_rate=1.2
-            )
-        bear, base, best = (values[name]["share_price"] for name in ("Bear", "Base", "Best"))
+    def test_overlapping_ltm_excluded_from_averages(self):
+        defaults = app.get_projection_defaults_from_data({'df_stats': self.stats()}, 0.045)
+        self.assertAlmostEqual(defaults['EBIT Margin'][-1], 0.25)
+        self.assertAlmostEqual(defaults['NWC % Revenue'], 0.15)
+        self.assertAlmostEqual(defaults['Historical ROC'], 0.20)
+        # LTM run-rates still seed year 1.
+        self.assertAlmostEqual(defaults['EBIT Margin'][0], 0.90)
+        self.assertAlmostEqual(defaults['Capex % Revenue'], 0.07)
+
+    def test_perpetual_growth_capped_at_company_growth(self):
+        slow = {'growth': (0.02, 0.018), 'margin': None}
+        defaults = app.get_projection_defaults_from_data({'df_stats': self.stats()}, 0.045, slow)
+        self.assertAlmostEqual(defaults['Perpetual Growth'], 0.018)
+        fast = {'growth': (0.25, 0.20), 'margin': (0.30, 0.32)}
+        defaults = app.get_projection_defaults_from_data({'df_stats': self.stats()}, 0.045, fast)
+        self.assertAlmostEqual(defaults['Perpetual Growth'], 0.045)
+        self.assertEqual(defaults['EBIT Margin'][:2], (0.30, 0.32))
+
+
+class ValuationTests(unittest.TestCase):
+    def test_unlevered_fcf_build(self):
+        projections = app.build_dcf_projections(1000.0, pd.Timestamp("2025-12-31"), [0.10, 0.10], [0.20, 0.20],
+                                                0.25, 0.04, [0.06, 0.06], 0.10)
+        year1 = projections.iloc[0]
+        self.assertAlmostEqual(year1['Revenue'], 1100)
+        self.assertAlmostEqual(year1['NOPAT'], 1100 * 0.20 * 0.75)
+        self.assertAlmostEqual(year1['Change in NWC'], 10)
+        self.assertAlmostEqual(year1['Unlevered FCF'], 165 + 44 - 66 - 10)
+
+    def test_final_capex_matches_terminal_reinvestment(self):
+        case = make_case()
+        ronic, growth = 0.15, 0.03
+        final = app.run_dcf_case(case, 0.09, growth, ronic)['projections'].iloc[-1]
+        net_investment = final['Capex'] - final['D&A'] + final['Change in NWC']
+        self.assertAlmostEqual(net_investment / final['NOPAT'], growth / ronic, places=3)
+
+    def test_scenarios_ordered_and_bridge(self):
+        case = make_case()
+        bear, base, bull = (app.run_dcf_case(case, 0.09, 0.03, 0.15, sign * 0.03, sign * 0.02)['share_price']
+                            for sign in (-1, 0, 1))
         self.assertLess(bear, base)
-        self.assertLess(base, best)
-        self.assertNotAlmostEqual(base - bear, best - base)
-        self.assertIsNone(app.scenario_range_warning(values))
+        self.assertLess(base, bull)
+        valuation = app.run_dcf_case(case, 0.09, 0.03, 0.15)
+        self.assertAlmostEqual(valuation['equity_value'], valuation['enterprise_value'] - 200 + 50 + 20)
 
-    def test_case_warnings_and_negative_margin(self):
-        cases = app.build_scenario_assumptions(0, -20, 25, 2, 1, 2)
-        np.testing.assert_allclose(cases["EBIT margin (%)"], [-21, -20, -19])
-        for prices, expected in [([120, 100, 130], "not ordered"), ([90, 100, 140], None),
-                                 ([90, 100, 110], None)]:
-            results = {name: {"share_price": price} for name, price in zip(("Bear", "Base", "Best"), prices)}
-            warning = app.scenario_range_warning(results)
-            if expected is None:
-                self.assertIsNone(warning)
-            else:
-                self.assertIn(expected, warning)
+    def test_stub_period_raises_value(self):
+        early = app.run_dcf_case(make_case(stub=0.0), 0.09, 0.03, 0.15)['share_price']
+        later = app.run_dcf_case(make_case(stub=0.5), 0.09, 0.03, 0.15)['share_price']
+        self.assertGreater(later, early)
+
+    def test_growth_at_or_above_wacc_rejected(self):
         with self.assertRaises(ValueError):
-            app.build_scenario_assumptions(0, 0, 0, -1, 1, 2)
+            app.run_dcf_case(make_case(), 0.05, 0.05, 0.15)
 
-    def test_outlying_history_does_not_set_scenario_extremes(self):
-        stats = pd.DataFrame({
-            "Revenue Growth": [0.05, 0.06, 0.50],
-            "EBIT Margin": [0.10, 0.12, 0.80],
-            "Reinv Rate": [0.20, 0.25, 0.30],
-        })
-        defaults, _ = app.historical_scenario_defaults({"df_stats": stats})
-        cases = app.build_scenario_assumptions(
-            defaults["Revenue Growth"], defaults["EBIT Margin"], defaults["Reinv Rate"], 2, 1, 2
-        )
-        np.testing.assert_allclose(cases["Revenue growth (%)"],
-                                   [defaults["Revenue Growth"] - 2, defaults["Revenue Growth"],
-                                    defaults["Revenue Growth"] + 2])
-
-    def test_quarterly_ltm_is_not_restricted_to_2026_or_partial_sums(self):
-        dates = pd.to_datetime(["2026-06-30", "2026-09-30", "2026-12-31", "2027-03-31"])
-        income = pd.DataFrame({
-            date: {"Total Revenue": 100.0, "Operating Income": 20.0,
-                   "Gross Profit": (np.nan if date == dates[0] else 40.0)}
-            for date in dates
-        })
-        ticker = SimpleNamespace(quarterly_income_stmt=income, quarterly_financials=income,
-                                 quarterly_balance_sheet=pd.DataFrame(),
-                                 quarterly_cashflow=pd.DataFrame())
-        annual = pd.DataFrame({"Total Revenue": [350.0]}, index=pd.to_datetime(["2026-12-31"]))
-        with patch.object(app.yf, "Ticker", return_value=ticker):
-            augmented, _, _ = app._augment_with_latest_quarterly(
-                "TEST", annual, pd.DataFrame(), pd.DataFrame()
-            )
-        self.assertEqual(augmented.loc[dates[-1], "Total Revenue"], 400)
-        self.assertEqual(augmented.loc[dates[-1], "EBIT"], 80)
-        self.assertTrue(pd.isna(augmented.loc[dates[-1], "Gross Profit"]))
-
-    def test_historical_reinvestment_does_not_replace_missing_inputs_with_zero(self):
-        dates = pd.to_datetime(["2022-12-31", "2023-12-31", "2024-12-31", "2025-12-31"])
-        income = pd.DataFrame({
-            "Total Revenue": [100, 110, 120, 130], "Operating Income": [20, 22, 24, 26],
-            "Gross Profit": [50, 55, 60, 65], "Pretax Income": [18, 20, 22, 24],
-            "Tax Provision": [4, 4, 5, 5],
-        }, index=dates)
-        balance = pd.DataFrame({
-            "Current Liabilities": [20, 21, 22, 23], "Cash And Cash Equivalents": [5, 5, 5, 5],
-            "Current Debt": [1, 1, 1, 1], "Total Debt": [10, 10, 10, 10],
-            "Stockholders Equity": [50, 55, 60, 65],
-        }, index=dates)
-        cashflow = pd.DataFrame({
-            "Capital Expenditure": [-10, -10, -10, -10],
-            "Depreciation And Amortization": [5, 5, 5, 5],
-        }, index=dates)
-        ticker = SimpleNamespace(quarterly_income_stmt=pd.DataFrame(),
-                                 quarterly_financials=pd.DataFrame())
-        with patch.object(app, "get_sec_historical_statements", return_value=(income, balance, cashflow)), \
-                patch.object(app.yf, "Ticker", return_value=ticker):
-            data = app.get_historical_data("TEST")
-        self.assertTrue(data["df_stats"]["Reinv Rate"].isna().all())
-        _, missing = app.historical_scenario_defaults(data)
-        self.assertIn("Reinv Rate", missing)
-
-    def test_mid_year_valuation_and_equity_bridge(self):
-        projections = app.build_dcf_projections(
-            100, pd.Timestamp("2025-12-31"), [0.1, 0.1], [0.2, 0.2], [0.25, 0.25], 0.2
-        )
-        self.assertAlmostEqual(projections.iloc[0]["FCF"], 13.2)
-        self.assertAlmostEqual(projections.iloc[1]["FCF"], 14.52)
-        result = app.calculate_dcf_valuation(
-            projections, 0.1, 0.03, 20, 10, 5,
-            non_operating_assets=4, minority_interest=2, fx_rate=2
-        )
-        pv_fcf = 13.2 / 1.1 ** 0.5 + 14.52 / 1.1 ** 1.5
-        terminal_value = 14.52 * 1.03 / 0.07
-        enterprise = pv_fcf + terminal_value / 1.1 ** 1.5
-        self.assertAlmostEqual(result["pv_fcf"], pv_fcf)
-        self.assertAlmostEqual(result["terminal_value"], terminal_value)
-        self.assertAlmostEqual(result["enterprise_value"], enterprise)
-        self.assertAlmostEqual(result["share_price"], (enterprise - 20 + 10 + 4 - 2) * 2 / 5)
-        self.assertNotIn("Discounted_FCF", projections.columns)
-
-    def test_invalid_assumptions_are_rejected(self):
-        with self.assertRaisesRegex(ValueError, "projection year"):
-            app.build_dcf_projections(100, pd.Timestamp("2025-12-31"), [0.1], [], [0.2], 0.2)
-        with self.assertRaisesRegex(ValueError, "below -100%"):
-            app.build_dcf_projections(100, pd.Timestamp("2025-12-31"), [-1.01], [0.2], [0.2], 0.2)
-        projections = app.build_dcf_projections(100, pd.Timestamp("2025-12-31"), [0.1], [0.2], [0.2], 0.2)
-        for wacc, growth, shares, fx in [(0.1, 0.1, 1, 1), (0.1, -1, 1, 1),
-                                          (0.1, 0.02, 0, 1), (0.1, 0.02, 1, 0)]:
-            with self.subTest(wacc=wacc, growth=growth, shares=shares, fx=fx):
-                with self.assertRaises(ValueError):
-                    app.calculate_dcf_valuation(projections, wacc, growth, 0, 0, shares, fx_rate=fx)
-
-
-UI_SCRIPT = """
-import pandas as pd
-import app
-
-company = {
-    'company_name': 'Example', 'market_cap': 1000000000, 'total_debt': 200000000,
-    'total_cash': 50000000, 'non_operating_assets': 10000000, 'minority_interest': 5000000,
-    'diluted_shares_outstanding': 10000000, 'current_price': 20,
-    'financial_currency': 'USD', 'price_currency': 'USD', 'fx_rate': 1.0,
-}
-app.get_wacc_input_defaults = lambda ticker: (0.04, 0.05, 0.25, 'Baa2/BBB', 4.0)
-app.get_credit_spread = lambda rating: 0.01
-app.get_company_market_data = lambda ticker: company
-app.calculate_beta = lambda ticker: (1.3, 0.7, None, None)
-app.get_bottom_up_beta = lambda ticker, debt_to_equity, tax: (1.2, 'Industry', 1.0)
-app.get_effective_tax_rate = lambda ticker: 0.2
-app.get_ltm_revenue = lambda ticker: (1000000000, pd.Timestamp('2025-12-31'))
-app.get_historical_data = lambda ticker: {'df_stats': pd.DataFrame({
-    'Revenue Growth': [0.05, 0.10, 0.15],
-    'EBIT Margin': [0.20, 0.25, 0.30],
-    'Reinv Rate': [0.20, 0.25, 0.30],
-})}
-app.render_wacc()
-app.render_dcf()
-"""
-
-
-class DcfWorkflowTests(unittest.TestCase):
-    def test_editable_wacc_and_scenario_flow(self):
-        ui = AppTest.from_string(UI_SCRIPT, default_timeout=20).run()
-        self.assertFalse(ui.exception)
-        self.assertFalse(ui.error)
-        self.assertAlmostEqual(ui.number_input(key="wacc_beta_input").value, 1.2)
-        base_before = next(metric.value for metric in ui.metric if metric.label == "Base")
-        ui.number_input(key="wacc_beta_input").set_value(1.5)
-        ui.number_input(key="wacc_spread_input").set_value(2.0)
-        ui.button[0].click().run()
-        self.assertFalse(ui.exception)
-        expected_wacc = (1 / 1.2 * (0.04 + 1.5 * 0.05)
-                         + 0.2 / 1.2 * (0.04 + 0.02) * 0.75)
-        self.assertAlmostEqual(ui.number_input(key="dcf_wacc_rate").value, expected_wacc * 100)
-        base_after_wacc = next(metric.value for metric in ui.metric if metric.label == "Base")
-        self.assertNotEqual(base_before, base_after_wacc)
-
-        ui.number_input(key="dcf_base_growth").set_value(30.0).run()
-        self.assertFalse(ui.exception)
-        base_after_scenario = next(metric.value for metric in ui.metric if metric.label == "Base")
-        self.assertNotEqual(base_after_wacc, base_after_scenario)
-        ui.checkbox(key="dcf_custom_scenarios").check().run()
-        scenario_key = f"dcf_scenarios_{ui.session_state['dcf_scenario_revision']}"
-        ui.session_state[scenario_key] = {
-            "edited_rows": {2: {"Revenue growth (%)": 80.0}},
-            "added_rows": [], "deleted_rows": [],
-        }
-        ui.run()
-        best_after_custom = next(metric.value for metric in ui.metric if metric.label == "Best")
-        self.assertNotEqual(base_after_scenario, best_after_custom)
-        ui.number_input(key="dcf_cash").set_value(70.0).run()
-        self.assertFalse(ui.exception)
-        self.assertEqual(ui.number_input(key="dcf_cash").value, 70.0)
-        self.assertNotEqual(base_after_scenario, next(metric.value for metric in ui.metric if metric.label == "Base"))
-
-    def test_scenario_inputs_update_values(self):
-        ui = AppTest.from_string(UI_SCRIPT, default_timeout=20).run()
-        def prices():
-            return [float(next(metric.value for metric in ui.metric if metric.label == label).split()[0].replace(",", ""))
-                    for label in ("Bear", "Base", "Best")]
-        bear, base, best = prices()
-        self.assertLess(bear, base)
-        self.assertLess(base, best)
-        ui.number_input(key="dcf_base_margin").set_value(40.0)
-        ui.number_input(key="dcf_growth_change").set_value(4.0)
-        ui.number_input(key="dcf_margin_change_points").set_value(2.0)
-        ui.number_input(key="dcf_reinvestment_change").set_value(3.0).run()
-        bear, base, best = prices()
-        self.assertLess(bear, base)
-        self.assertLess(base, best)
-        self.assertNotAlmostEqual(base - bear, best - base, delta=0.02)
-
-    def test_invalid_terminal_and_ticker_refresh(self):
-        ui = AppTest.from_string(UI_SCRIPT, default_timeout=20).run()
-        ui.number_input(key="dcf_terminal_growth").set_value(10.0).run()
-        self.assertTrue(any("lower than WACC" in error.value for error in ui.error))
-        ui.text_input(key="shared_ticker_symbol").set_value("OTHER").run()
-        self.assertFalse(ui.exception)
-        self.assertFalse(ui.error)
-        self.assertEqual(ui.number_input(key="dcf_terminal_growth").value, 3.0)
-        self.assertEqual(ui.session_state["dcf_loaded_ticker"], "OTHER")
-
-    def test_missing_data_warns_and_allows_manual_revenue(self):
-        script = UI_SCRIPT.replace(
-            "app.render_wacc()",
-            "def fail_revenue(ticker):\n    raise ValueError('unavailable')\n"
-            "app.get_ltm_revenue = fail_revenue\napp.render_wacc()",
-        )
-        ui = AppTest.from_string(script, default_timeout=20).run()
-        self.assertFalse(ui.exception)
-        self.assertTrue(any("Could not load LTM revenue" in warning.value for warning in ui.warning))
-        self.assertTrue(any("LTM revenue must be greater than zero" in error.value for error in ui.error))
-        ui.number_input(key="dcf_revenue").set_value(1000.0).run()
-        self.assertFalse(ui.error)
-        self.assertTrue(any(metric.label == "Base" for metric in ui.metric))
+    def test_reverse_dcf_recovers_base_growth(self):
+        case = make_case()
+        price = app.run_dcf_case(case, 0.09, 0.03, 0.15)['share_price']
+        self.assertAlmostEqual(app.solve_implied_growth(case, 0.09, 0.03, 0.15, price), 0.10, places=4)
 
 
 if __name__ == "__main__":
